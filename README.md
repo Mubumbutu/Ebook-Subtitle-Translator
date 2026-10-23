@@ -1,4 +1,4 @@
-# EPUB / SRT / TXT / PDF / Kindle / FB2 / DOCX Translator with LLM
+# EPUB / SRT / TXT / ASS / PDF / Kindle / FB2 / DOCX Translator with LLM
 
 <p align="center">
 </p>
