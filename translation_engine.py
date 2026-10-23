@@ -8,6 +8,7 @@ import threading
 from abc import ABC, abstractmethod
 from openrouter import OpenRouter
 from typing import Dict, List, Optional, Tuple, Union
+from app_utils import TagProfile
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,21 @@ class BatchSplitError(Exception):
 
 
 class SentenceBatcher:
+    def __init__(self, tag_profile: Optional[TagProfile] = None):
+        self.tag_profile = tag_profile or TagProfile()
+
+    @staticmethod
+    def _any_number_re(pattern: re.Pattern) -> re.Pattern:
+        return re.compile(pattern.pattern.replace(r'\d{2}', r'\d+'))
+        
     def prepare_batch(self, fragments: List[Dict]) -> Tuple[str, List[int]]:
+        tp = self.tag_profile
+        reserve_open = self._any_number_re(tp.reserve_open_re())
+        reserve_close = self._any_number_re(tp.reserve_close_re())
+        inline_open = self._any_number_re(tp.inline_open_re())
+        inline_close = self._any_number_re(tp.inline_close_re())
+        ps_tag = f"<{tp.paragraph_separator}>"
+
         renumbered_texts = []
         offsets_list = []
         current_offset = 0
@@ -25,80 +40,108 @@ class SentenceBatcher:
         for frag in fragments:
             original_text = frag.get('original_text', '')
             processing_mode = frag.get('processing_mode', 'inline')
+            use_ps_markers = frag.get('use_ps_markers', False)
             offset = current_offset
 
+            if use_ps_markers and processing_mode == 'inline' and '\n' in original_text:
+                tokens = re.split(r'(\n\n|\n)', original_text)
+                parts = []
+                for i, token in enumerate(tokens):
+                    if i % 2 == 0 and token.strip():
+                        parts.append(token.strip())
+                original_text = ps_tag.join(parts)
+
             if processing_mode == 'legacy':
-                def _renumber_legacy(m, off=offset):
-                    return f"<id_{int(m.group(1)) + off:02d}>"
-                def _renumber_legacy_close(m, off=offset):
-                    return f"</id_{int(m.group(1)) + off:02d}>"
-                text = re.sub(r'<id_(\d+)>', _renumber_legacy, original_text)
-                text = re.sub(r'</id_(\d+)>', _renumber_legacy_close, text)
+                text = reserve_open.sub(
+                    lambda m, off=offset: tp.reserve_placeholder(int(m.group(1)) + off),
+                    original_text
+                )
+                text = reserve_close.sub(
+                    lambda m, off=offset: f"</{tp.reserve_prefix}{int(m.group(1)) + off:02d}>",
+                    text
+                )
                 offset_size = len(frag.get('reserve_elements', []))
             else:
-                def _renumber_inline(m, off=offset):
-                    return f"<p_{int(m.group(1)) + off:02d}>"
-                def _renumber_inline_close(m, off=offset):
-                    return f"</p_{int(m.group(1)) + off:02d}>"
-                text = re.sub(r'<p_(\d+)>', _renumber_inline, original_text)
-                text = re.sub(r'</p_(\d+)>', _renumber_inline_close, text)
+                text = inline_open.sub(
+                    lambda m, off=offset: tp.inline_open_placeholder(int(m.group(1)) + off),
+                    original_text
+                )
+                text = inline_close.sub(
+                    lambda m, off=offset: tp.inline_close_placeholder(int(m.group(1)) + off),
+                    text
+                )
                 offset_size = len(frag.get('inline_formatting_map', {}))
 
             renumbered_texts.append(text)
             offsets_list.append(offset)
             current_offset += offset_size
 
-        return '<z>'.join(renumbered_texts), offsets_list
+        return f"<{tp.batch_separator}>".join(renumbered_texts), offsets_list
 
     def split_response(self, response: str, n: int, offsets: List[int]) -> List[str]:
-        parts = response.split('<z>')
+        tp = self.tag_profile
+        parts = tp.batch_sep_re().split(response)
         if len(parts) != n:
             raise BatchSplitError(
                 f"Expected {n} segments, found {len(parts)}"
             )
 
+        reserve_open = self._any_number_re(tp.reserve_open_re())
+        reserve_close = self._any_number_re(tp.reserve_close_re())
+        inline_open = self._any_number_re(tp.inline_open_re())
+        inline_close = self._any_number_re(tp.inline_close_re())
+        ps_re = tp.paragraph_sep_re()
+
         result = []
         for i, part in enumerate(parts):
             off = offsets[i]
             if off == 0:
-                result.append(part)
-                continue
+                restored = part
+            else:
+                restored = reserve_open.sub(
+                    lambda m, o=off: tp.reserve_placeholder(int(m.group(1)) - o),
+                    part
+                )
+                restored = reserve_close.sub(
+                    lambda m, o=off: f"</{tp.reserve_prefix}{int(m.group(1)) - o:02d}>",
+                    restored
+                )
+                restored = inline_open.sub(
+                    lambda m, o=off: tp.inline_open_placeholder(int(m.group(1)) - o),
+                    restored
+                )
+                restored = inline_close.sub(
+                    lambda m, o=off: tp.inline_close_placeholder(int(m.group(1)) - o),
+                    restored
+                )
 
-            def _restore_legacy_open(m, o=off):
-                return f"<id_{int(m.group(1)) - o:02d}>"
-            def _restore_legacy_close(m, o=off):
-                return f"</id_{int(m.group(1)) - o:02d}>"
-            def _restore_inline_open(m, o=off):
-                return f"<p_{int(m.group(1)) - o:02d}>"
-            def _restore_inline_close(m, o=off):
-                return f"</p_{int(m.group(1)) - o:02d}>"
-
-            restored = re.sub(r'<id_(\d+)>', _restore_legacy_open, part)
-            restored = re.sub(r'</id_(\d+)>', _restore_legacy_close, restored)
-            restored = re.sub(r'<p_(\d+)>', _restore_inline_open, restored)
-            restored = re.sub(r'</p_(\d+)>', _restore_inline_close, restored)
+            restored = ps_re.sub('\n', restored)
             result.append(restored)
 
         return result
 
-    @staticmethod
-    def count_sentence_markers(text: str) -> int:
-        return text.count('<z>')
+    def count_sentence_markers(self, text: str) -> int:
+        return len(self.tag_profile.batch_sep_re().findall(text))
 
     def build_batch_hint(self, n: int, template: str = "") -> str:
         marker_count = n - 1
+        sep = f"<{self.tag_profile.batch_separator}>"
         if template:
-            return template.replace("{n}", str(n)).replace("{marker_count}", str(marker_count))
-        example_in = "Hello world.<z>How are you?<z>Fine, thanks."
-        example_out = "Hola mundo.<z>¿Cómo estás?<z>Bien, gracias."
+            return (
+                template.replace("<z>", sep)
+                .replace("{n}", str(n))
+                .replace("{marker_count}", str(marker_count))
+            )
+        example_in = f"Hello world.{sep}How are you?{sep}Fine, thanks."
+        example_out = f"Hola mundo.{sep}¿Cómo estás?{sep}Bien, gracias."
         return (
             f"=== CRITICAL BATCH INSTRUCTION ===\n"
-            f"The text below contains exactly {marker_count} separator marker(s) <z> dividing it into {n} separate paragraphs.\n"
+            f"The text below contains exactly {marker_count} separator marker(s) {sep} dividing it into {n} separate paragraphs.\n"
             f"RULES — you MUST follow ALL of them:\n"
-            f"1. Preserve every <z> marker exactly as-is — do NOT remove, add, move, or translate them.\n"
-            f"2. Output EXACTLY {marker_count} <z> marker(s) in your translation — no more, no fewer.\n"
-            f"3. The <z> marker is NOT an HTML tag — treat it as a literal paragraph boundary separator.\n"
-            f"4. Translate each segment between <z> markers independently.\n"
+            f"1. Preserve every {sep} marker exactly as-is — do NOT remove, add, move, or translate them.\n"
+            f"2. Output EXACTLY {marker_count} {sep} marker(s) in your translation — no more, no fewer.\n"
+            f"3. The {sep} marker is NOT an HTML tag — treat it as a literal paragraph boundary separator.\n"
+            f"4. Translate each segment between {sep} markers independently.\n"
             f"Example input:  {example_in}\n"
             f"Example output: {example_out}\n"
             f"==================================="
@@ -118,13 +161,15 @@ class LLMClient(ABC):
         pass
 
 class LMStudioClient(LLMClient):
-    def __init__(self, endpoint: str = "http://localhost:1234/v1/chat/completions"):
+    def __init__(self, endpoint: str = "http://localhost:1234/v1/chat/completions", enable_thinking: bool = True):
         self.endpoint = endpoint
+        self.enable_thinking = enable_thinking
+        self.last_raw_response = ""
         self._active_session = None
         self._active_response = None
         self._session_lock = threading.Lock()
         self._abort_event = threading.Event()
-        logger.info(f"Initialized LM Studio client: {endpoint}")
+        logger.info(f"Initialized LM Studio client: {endpoint} (thinking: {enable_thinking})")
 
     def abort(self):
         self._abort_event.set()
@@ -146,6 +191,7 @@ class LMStudioClient(LLMClient):
 
     def _stream_response(self, session, payload, headers, timeout_seconds):
         chunks = []
+        reasoning_chunks = []
         start_time = time.monotonic()
         response = session.post(
             self.endpoint,
@@ -182,6 +228,9 @@ class LMStudioClient(LLMClient):
                 try:
                     data = json.loads(line)
                     delta = data.get("choices", [{}])[0].get("delta", {})
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    if reasoning:
+                        reasoning_chunks.append(reasoning)
                     token = delta.get("content")
                     if token:
                         chunks.append(token)
@@ -192,138 +241,92 @@ class LMStudioClient(LLMClient):
                 if self._active_response is response:
                     self._active_response = None
 
-        return "".join(chunks)
+        content = "".join(chunks)
+        reasoning_str = "".join(reasoning_chunks).strip()
+        if reasoning_str:
+            full = f"<thinking>\n{reasoning_str}\n</thinking>\n\n{content}"
+        else:
+            full = content
+        return content, full
 
     def translate(
         self,
-        prompt: List[Dict],
+        prompt: Union[str, List[Dict]],
         temperature: float,
         timeout_seconds: int,
         top_p: Optional[float] = None,
-        top_k: Optional[int] = None,
-        max_retries: int = 5
+        top_k: Optional[int] = None
     ) -> str:
-        for attempt in range(1, max_retries + 1):
-            self._wait_for_rate_limit()
+        self.last_raw_response = ""
 
-            self._last_request_time = time.time()
+        if isinstance(prompt, list):
+            messages = prompt
+        else:
+            messages = [{"role": "user", "content": prompt}]
 
-            try:
-                logger.debug(
-                    f"OpenRouter SDK request (attempt {attempt}/{max_retries}): "
-                    f"model={self.model_name}, temp={temperature}, "
-                    f"timeout={timeout_seconds}s, free={self.is_free_model}"
-                )
+        payload = {
+            "model": "local-model",
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if top_k is not None:
+            payload["top_k"] = top_k
+        if not self.enable_thinking:
+            payload["reasoning_effort"] = "none"
 
-                extra_params = {}
-                if top_p is not None:
-                    extra_params["top_p"] = top_p
-                if top_k is not None:
-                    extra_params["top_k"] = top_k
+        headers = {"Content-Type": "application/json"}
 
-                with OpenRouter(api_key=self.api_key) as client:
-                    response = client.chat.send(
-                        model=self.model_name,
-                        messages=prompt,
-                        temperature=temperature,
-                        timeout_ms=int(timeout_seconds * 1000),
-                        **extra_params
-                    )
+        session = requests.Session()
+        with self._session_lock:
+            self._active_session = session
+            self._abort_event.clear()
 
-                if not response.choices:
-                    logger.warning("OpenRouter returned no choices")
-                    return ""
+        try:
+            logger.debug(
+                f"LM Studio request: endpoint={self.endpoint}, "
+                f"temp={temperature}, timeout={timeout_seconds}s, "
+                f"thinking={self.enable_thinking}, "
+                f"messages={len(messages)}"
+            )
+            content, full = self._stream_response(session, payload, headers, timeout_seconds)
+            self.last_raw_response = full
+            if not content:
+                logger.warning("LM Studio returned empty response")
+                return ""
+            logger.debug(f"LM Studio response: {len(content)} chars (raw: {len(full)} chars)")
+            return content
 
-                content = response.choices[0].message.content
+        except requests.Timeout:
+            logger.error(f"LM Studio timeout after {timeout_seconds}s")
+            raise TimeoutError(f"LM Studio request timed out after {timeout_seconds}s")
 
-                if not content:
-                    logger.warning("OpenRouter returned empty content")
-                    return ""
+        except requests.RequestException as e:
+            logger.error(f"LM Studio request failed: {e}")
+            raise
 
-                logger.debug(f"OpenRouter response: {len(content)} chars")
-                return content
-
-            except Exception as e:
-                err_str = str(e)
-
-                if self._is_rate_limit_error(e):
-                    self._last_request_time = time.time()
-
-                    wait_seconds = min(10.0 * attempt, 120.0)
-
-                    if attempt < max_retries:
-                        logger.warning(
-                            f"[OpenRouter] Rate limited 429 "
-                            f"(attempt {attempt}/{max_retries}). "
-                            f"Waiting {wait_seconds:.0f}s before retry..."
-                        )
-                        time.sleep(wait_seconds)
-                        continue
-                    else:
-                        logger.error(
-                            f"[OpenRouter] Rate limited - "
-                            f"max retries ({max_retries}) reached. Giving up."
-                        )
-                        raise Exception(
-                            f"OpenRouter rate limit exceeded after {max_retries} attempts"
-                        )
-
-                is_timeout = (
-                    "timeout" in err_str.lower()
-                    or "timed out" in err_str.lower()
-                )
-
-                if is_timeout:
-                    logger.error(f"OpenRouter timeout after {timeout_seconds}s")
-                    raise TimeoutError(
-                        f"OpenRouter request timed out after {timeout_seconds}s"
-                    )
-
-                is_not_found = (
-                    "404" in err_str
-                    or "not found" in err_str.lower()
-                    or ("model" in err_str.lower() and "not" in err_str.lower())
-                )
-
-                if is_not_found:
-                    raise Exception(
-                        f"OpenRouter model not found: '{self.model_name}'\n"
-                        f"Check the model name at openrouter.ai/models\n"
-                        f"Details: {err_str}"
-                    )
-
-                is_auth_error = (
-                    "401" in err_str
-                    or "403" in err_str
-                    or "unauthorized" in err_str.lower()
-                    or "forbidden" in err_str.lower()
-                    or "invalid api key" in err_str.lower()
-                )
-
-                if is_auth_error:
-                    raise Exception(
-                        f"OpenRouter authentication error.\n"
-                        f"Check your API key in Options tab.\n"
-                        f"Details: {err_str}"
-                    )
-
-                logger.error(f"OpenRouter request failed: {err_str}")
-                raise Exception(f"OpenRouter error: {err_str}")
-
-        raise Exception(f"OpenRouter: all {max_retries} attempts failed")
+        finally:
+            with self._session_lock:
+                if self._active_session is session:
+                    self._active_session = None
                 
 class OllamaClient(LLMClient):
     def __init__(
         self,
         model_name: str,
-        endpoint: str = "http://localhost:11434"
+        endpoint: str = "http://localhost:11434",
+        enable_thinking: bool = True
     ):
         self.model_name = model_name
         self.endpoint = endpoint
+        self.enable_thinking = enable_thinking
+        self.last_raw_response = ""
         self.api_url = f"{endpoint.rstrip('/')}/api/chat"
         self._active_session = None
         self._session_lock = threading.Lock()
-        logger.info(f"Initialized Ollama client: {endpoint} (model: {model_name})")
+        logger.info(f"Initialized Ollama client: {endpoint} (model: {model_name}, thinking: {enable_thinking})")
  
     def abort(self):
         with self._session_lock:
@@ -343,6 +346,8 @@ class OllamaClient(LLMClient):
         top_p: Optional[float] = None,
         top_k: Optional[int] = None
     ) -> str:
+        self.last_raw_response = ""
+
         if isinstance(prompt, list):
             messages = prompt
         else:
@@ -360,6 +365,8 @@ class OllamaClient(LLMClient):
             "options": options,
             "stream": False
         }
+        if not self.enable_thinking:
+            payload["think"] = False
         headers = {"Content-Type": "application/json"}
 
         session = requests.Session()
@@ -367,7 +374,7 @@ class OllamaClient(LLMClient):
             self._active_session = session
 
         try:
-            logger.debug(f"Ollama request: model={self.model_name}, temp={temperature}, timeout={timeout_seconds}s")
+            logger.debug(f"Ollama request: model={self.model_name}, temp={temperature}, timeout={timeout_seconds}s, thinking={self.enable_thinking}")
             response = session.post(
                 self.api_url,
                 json=payload,
@@ -376,11 +383,19 @@ class OllamaClient(LLMClient):
             )
             response.raise_for_status()
             data = response.json()
-            content = data.get("message", {}).get("content", "")
+            message = data.get("message", {}) or {}
+            content = message.get("content", "") or ""
+            thinking = message.get("thinking", "") or ""
+            thinking_str = thinking.strip()
+            if thinking_str:
+                full = f"<thinking>\n{thinking_str}\n</thinking>\n\n{content}"
+            else:
+                full = content
+            self.last_raw_response = full
             if not content:
                 logger.warning("Ollama returned empty response")
                 return ""
-            logger.debug(f"Ollama response: {len(content)} chars")
+            logger.debug(f"Ollama response: {len(content)} chars (raw: {len(full)} chars)")
             return content
 
         except requests.Timeout:
@@ -397,9 +412,11 @@ class OllamaClient(LLMClient):
                     self._active_session = None
 
 class OpenRouterClient(LLMClient):
-    def __init__(self, api_key: str, model_name: str):
+    def __init__(self, api_key: str, model_name: str, enable_thinking: bool = True):
         self.api_key = api_key
         self.model_name = model_name
+        self.enable_thinking = enable_thinking
+        self.last_raw_response = ""
 
         self.is_free_model = model_name.strip().endswith(":free")
 
@@ -408,7 +425,7 @@ class OpenRouterClient(LLMClient):
 
         logger.info(
             f"Initialized OpenRouter client (model: {model_name}, "
-            f"free_model: {self.is_free_model})"
+            f"free_model: {self.is_free_model}, thinking: {enable_thinking})"
         )
 
     def _wait_for_rate_limit(self):
@@ -453,6 +470,8 @@ class OpenRouterClient(LLMClient):
         top_k: Optional[int] = None,
         max_retries: int = 5
     ) -> str:
+        self.last_raw_response = ""
+
         for attempt in range(1, max_retries + 1):
             self._wait_for_rate_limit()
 
@@ -462,7 +481,8 @@ class OpenRouterClient(LLMClient):
                 logger.debug(
                     f"OpenRouter SDK request (attempt {attempt}/{max_retries}): "
                     f"model={self.model_name}, temp={temperature}, "
-                    f"timeout={timeout_seconds}s, free={self.is_free_model}"
+                    f"timeout={timeout_seconds}s, free={self.is_free_model}, "
+                    f"reasoning={self.enable_thinking}"
                 )
 
                 extra_params = {}
@@ -470,6 +490,8 @@ class OpenRouterClient(LLMClient):
                     extra_params["top_p"] = top_p
                 if top_k is not None:
                     extra_params["top_k"] = top_k
+                if not self.enable_thinking:
+                    extra_params["reasoning"] = {"enabled": False}
 
                 with OpenRouter(api_key=self.api_key) as client:
                     response = client.chat.send(
@@ -481,15 +503,41 @@ class OpenRouterClient(LLMClient):
 
                 if not response.choices:
                     logger.warning("OpenRouter returned no choices")
+                    self.last_raw_response = ""
                     return ""
 
-                content = response.choices[0].message.content
+                message = response.choices[0].message
+                content = message.content or ""
+
+                reasoning_str = ""
+                try:
+                    if hasattr(message, 'model_dump'):
+                        message_dict = message.model_dump()
+                    elif hasattr(message, 'dict'):
+                        message_dict = message.dict()
+                    else:
+                        message_dict = {}
+                    reasoning_val = (
+                        message_dict.get('reasoning')
+                        or message_dict.get('reasoning_content')
+                        or ''
+                    )
+                    if isinstance(reasoning_val, str):
+                        reasoning_str = reasoning_val.strip()
+                except Exception:
+                    reasoning_str = ""
+
+                if reasoning_str:
+                    full = f"<thinking>\n{reasoning_str}\n</thinking>\n\n{content}"
+                else:
+                    full = content
+                self.last_raw_response = full
 
                 if not content:
                     logger.warning("OpenRouter returned empty content")
                     return ""
 
-                logger.debug(f"OpenRouter response: {len(content)} chars")
+                logger.debug(f"OpenRouter response: {len(content)} chars (raw: {len(full)} chars)")
                 return content
 
             except Exception as e:
@@ -567,26 +615,27 @@ class LLMClientFactory:
         llm_choice: str,
         model_name: Optional[str] = None,
         api_key: Optional[str] = None,
-        endpoint: Optional[str] = None
+        endpoint: Optional[str] = None,
+        enable_thinking: bool = True
     ) -> LLMClient:
         if llm_choice == "LM Studio":
             if endpoint:
-                return LMStudioClient(endpoint)
-            return LMStudioClient()
+                return LMStudioClient(endpoint, enable_thinking=enable_thinking)
+            return LMStudioClient(enable_thinking=enable_thinking)
 
         elif llm_choice == "Ollama":
             if not model_name:
                 raise ValueError("Ollama requires model_name")
 
             if endpoint:
-                return OllamaClient(model_name, endpoint)
-            return OllamaClient(model_name)
+                return OllamaClient(model_name, endpoint, enable_thinking=enable_thinking)
+            return OllamaClient(model_name, enable_thinking=enable_thinking)
 
         elif llm_choice == "Openrouter":
             if not api_key or not model_name:
                 raise ValueError("OpenRouter requires api_key and model_name")
 
-            return OpenRouterClient(api_key, model_name)
+            return OpenRouterClient(api_key, model_name, enable_thinking=enable_thinking)
 
         else:
             raise ValueError(f"Unknown LLM choice: {llm_choice}")
@@ -740,25 +789,38 @@ class PromptBuilder:
             return messages
 
 class AutoFixManager:
-    def __init__(self, max_attempts: int, base_temperature: float):
+    def __init__(
+        self,
+        max_attempts: int,
+        base_temperature: float,
+        response_wrapper_tag: str = "translated",
+        tag_profile: Optional[TagProfile] = None
+    ):
         self.max_attempts = max_attempts
         self.base_temperature = base_temperature
         self.current_temperature = base_temperature
         self.history: List[Dict] = []
         self.best_attempt: Optional[Dict] = None
+        self.response_wrapper_tag = (response_wrapper_tag or "translated").strip() or "translated"
+        self.tag_profile = tag_profile or TagProfile()
 
-        logger.info(f"AutoFixManager initialized: max={max_attempts}, base_temp={base_temperature}")
+        logger.info(
+            f"AutoFixManager initialized: max={max_attempts}, base_temp={base_temperature}, "
+            f"wrapper={self.response_wrapper_tag}"
+        )
 
     def record_attempt(
         self,
         translation: str,
-        mismatch_flags: Dict
+        mismatch_flags: Dict,
+        raw_response: Optional[str] = None
     ) -> None:
         error_count = sum(1 for v in mismatch_flags.values() if v)
 
         attempt = {
             'attempt': len(self.history) + 1,
             'translation': translation,
+            'raw_response': raw_response,
             'mismatch_flags': mismatch_flags.copy(),
             'error_count': error_count,
             'temperature': self.current_temperature
@@ -907,6 +969,7 @@ class AutoFixManager:
                 ))
             lines.append("")
 
+        wrapper = self.response_wrapper_tag
         lines.append("INSTRUCTIONS:")
         if critical_issues:
             lines.append("- Focus on CRITICAL issues first - they break the document structure")
@@ -917,7 +980,7 @@ class AutoFixManager:
             if current_error_count > self.best_attempt['error_count']:
                 lines.append("- Use the BEST translation above as your starting point")
         lines.append("- Keep any parts that were already correct")
-        lines.append("- Return ONLY the corrected translation in <translated>...</translated> tags")
+        lines.append(f"- Return ONLY the corrected translation in <{wrapper}>...</{wrapper}> tags")
 
         return "\n".join(lines)
 
@@ -930,6 +993,13 @@ class AutoFixManager:
         use_ps_markers: bool = False
     ) -> List[str]:
         lines = []
+        tp = self.tag_profile
+        reserve_generic = f"<{tp.reserve_prefix}xx>"
+        inline_generic = f"<{tp.inline_prefix}xx>"
+        nt_generic = f"<{tp.non_trans_prefix}xx/>"
+        ps_tag = f"<{tp.paragraph_separator}>"
+        inline_examples_short = f"{tp.inline_open_placeholder(0)}, {tp.inline_open_placeholder(1)}..."
+        inline_examples = f"{tp.inline_open_placeholder(0)}, {tp.inline_open_placeholder(1)}"
 
         if flag_key == 'reserve_elements':
             if isinstance(flag_value, dict):
@@ -948,7 +1018,7 @@ class AutoFixManager:
                         lines.append(f"     ... and {len(extra) - 4} more")
                 if spurious:
                     lines.append(f"  ❌ Spurious CLOSING tags (LLM bug): {', '.join(spurious)}")
-                    lines.append(f"     → <id_xx> are self-closing — remove all closing tags!")
+                    lines.append(f"     → {reserve_generic} are self-closing — remove all closing tags!")
 
                 if pos_errors:
                     lines.append("")
@@ -957,18 +1027,20 @@ class AutoFixManager:
                         tag_id    = error.get('tag_id', '??')
                         orig_pct  = int(error.get('orig_rel_pos', 0) * 100)
                         trans_pct = int(error.get('trans_rel_pos', 0) * 100)
-                        lines.append(f"     • <id_{tag_id}> should be ~{orig_pct}% but is at ~{trans_pct}%")
+                        lines.append(
+                            f"     • <{tp.reserve_prefix}{tag_id}> should be ~{orig_pct}% but is at ~{trans_pct}%"
+                        )
 
         elif flag_key == 'nt_markers':
             if isinstance(flag_value, dict):
-                lines.append("  ❌ Non-translatable markers (<nt_xx/>) are wrong or missing")
+                lines.append(f"  ❌ Non-translatable markers ({nt_generic}) are wrong or missing")
                 if flag_value.get('missing'):
                     lines.append(f"     Missing: {', '.join(flag_value['missing'][:4])}")
                 if flag_value.get('positioning'):
                     lines.append("     Wrong position — must stay exactly where they were")
 
         elif flag_key == 'inline_formatting':
-            lines.append("  ❌ Inline formatting tags (<p_xx>) are broken or mismatched")
+            lines.append(f"  ❌ Inline formatting tags ({inline_generic}) are broken or mismatched")
 
             if isinstance(flag_value, dict) and flag_value:
                 if 'opening_tags' in flag_value:
@@ -987,7 +1059,7 @@ class AutoFixManager:
 
                 if 'unexpected_tags' in flag_value:
                     lines.append(f"     Found raw HTML tags: {', '.join(flag_value['unexpected_tags'])}")
-                    lines.append("     → Use ONLY <p_00>, <p_01>... placeholders")
+                    lines.append(f"     → Use ONLY {inline_examples_short} placeholders")
 
                 if flag_value.get('unpaired_tags'):
                     lines.append("     Unpaired opening/closing tags")
@@ -996,21 +1068,22 @@ class AutoFixManager:
                     lines.append("     Tags are in wrong places")
 
             else:
-                lines.append("     (no detailed info – probably missing/extra <p_XX> tags)")
+                lines.append(f"     (no detailed info – probably missing/extra {tp.inline_prefix.upper()}XX tags)")
 
-            if len(original.strip()) < 80 and '<p_' not in original:
-                lines.append("     💡 This looks like a chapter title — LLM often adds phantom <p_xx> tags here.")
+            if len(original.strip()) < 80 and f"<{tp.inline_prefix}" not in original:
+                lines.append(f"     💡 This looks like a chapter title — LLM often adds phantom {inline_generic} tags here.")
 
         elif flag_key == 'ps_markers':
-            ps_in_orig  = original.count('<ps>')
-            ps_in_trans = translation.count('<ps>')
+            ps_re = tp.paragraph_sep_re()
+            ps_in_orig  = len(ps_re.findall(original))
+            ps_in_trans = len(ps_re.findall(translation))
             lines.append(f"  ❌ Paragraph structure mismatch")
-            lines.append(f"     Original: {ps_in_orig} <ps> markers")
-            lines.append(f"     Translation: {ps_in_trans} <ps> markers")
+            lines.append(f"     Original: {ps_in_orig} {ps_tag} markers")
+            lines.append(f"     Translation: {ps_in_trans} {ps_tag} markers")
             if ps_in_orig > ps_in_trans:
-                lines.append(f"  → MISSING {ps_in_orig - ps_in_trans} <ps> marker(s)!")
+                lines.append(f"  → MISSING {ps_in_orig - ps_in_trans} {ps_tag} marker(s)!")
             elif ps_in_orig < ps_in_trans:
-                lines.append(f"  → TOO MANY {ps_in_trans - ps_in_orig} <ps> marker(s)!")
+                lines.append(f"  → TOO MANY {ps_in_trans - ps_in_orig} {ps_tag} marker(s)!")
 
         elif flag_key == 'length':
             if isinstance(flag_value, dict):
@@ -1039,7 +1112,7 @@ class AutoFixManager:
         elif flag_key == 'unexpected_html':
             lines.append("  ❌ Raw HTML tags found in output")
             lines.append(f"     Tags: {', '.join(flag_value) if isinstance(flag_value, list) else str(flag_value)}")
-            lines.append("     → Use ONLY <p_00>, <p_01> placeholders")
+            lines.append(f"     → Use ONLY {inline_examples} placeholders")
 
         elif flag_key == 'first_char':
             orig_first_char, orig_desc   = self._get_first_char_details(original)
@@ -1073,13 +1146,13 @@ class AutoFixManager:
         return lines
 
     def _get_first_char_details(self, text: str) -> tuple:
-        clean_text = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<nt_\d{2}/>|</?ps>', '', text)
+        clean_text = self.tag_profile.all_placeholders_re().sub('', text)
         clean_text = clean_text.lstrip()
 
         if not clean_text:
             return None, "empty"
 
-        ALL_QUOTES = '["\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
+        ALL_QUOTES = '[\"\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
         text_no_quotes = re.sub(f'^{ALL_QUOTES}+', '', clean_text).lstrip()
 
         if not text_no_quotes:
@@ -1101,13 +1174,13 @@ class AutoFixManager:
         return first_char, desc
 
     def _get_last_char_details(self, text: str) -> dict:
-        clean_text = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<nt_\d{2}/>|</?ps>', '', text)
+        clean_text = self.tag_profile.all_placeholders_re().sub('', text)
         clean_text = clean_text.rstrip()
 
         if not clean_text:
             return {'char': None, 'type': 'empty', 'description': 'empty text'}
 
-        ALL_QUOTES = '["\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
+        ALL_QUOTES = '[\"\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
         text_no_quotes = re.sub(f'{ALL_QUOTES}+$', '', clean_text).rstrip()
 
         if not text_no_quotes:
@@ -1148,15 +1221,24 @@ class TranslationOrchestrator:
         llm_client: LLMClient,
         prompt_builder: PromptBuilder,
         formatting_sync=None,
-        timeout_minutes: int = 10
+        timeout_minutes: int = 10,
+        response_wrapper_tag: str = "translated",
+        tag_profile: Optional[TagProfile] = None,
+        split_fn: Optional[callable] = None
     ):
         self.llm_client = llm_client
         self.prompt_builder = prompt_builder
         self.formatting_sync = formatting_sync
         self.timeout_seconds = timeout_minutes * 60
+        self.response_wrapper_tag = (response_wrapper_tag or "translated").strip() or "translated"
+        self.tag_profile = tag_profile or TagProfile()
+        self.split_fn = split_fn
         self._cancelled = False
 
-        logger.info(f"TranslationOrchestrator initialized: timeout={timeout_minutes}min")
+        logger.info(
+            f"TranslationOrchestrator initialized: timeout={timeout_minutes}min, "
+            f"wrapper={self.response_wrapper_tag}, split_fn={'YES' if split_fn else 'NO'}"
+        )
 
     def cancel(self):
         self._cancelled = True
@@ -1272,15 +1354,16 @@ class TranslationOrchestrator:
         logger.info("")
 
     def _restore_paragraph_structure(self, text: str, fragment: Dict) -> str:
+        ps_re = self.tag_profile.paragraph_sep_re()
+        ps_tag = f"<{self.tag_profile.paragraph_separator}>"
         original_text = fragment.get('original_text', '')
-        import re as _re
-        orig_has_ps = bool(_re.search(r'<ps>', original_text))
+        orig_has_ps = bool(ps_re.search(original_text))
 
         if not fragment.get('_had_newlines', False):
-            if not orig_has_ps and '<ps>' in text:
-                cleaned = _re.sub(r'<ps>', '', text).strip()
+            if not orig_has_ps and ps_re.search(text):
+                cleaned = ps_re.sub('', text).strip()
                 logger.warning(
-                    f"Stripped spurious <ps> from single-part fragment "
+                    f"Stripped spurious {ps_tag} from single-part fragment "
                     f"(original has no paragraph breaks)"
                 )
                 return cleaned
@@ -1291,9 +1374,9 @@ class TranslationOrchestrator:
         n_parts = len(original_parts)
 
         if n_parts <= 1:
-            if not orig_has_ps and '<ps>' in text:
-                cleaned = _re.sub(r'<ps>', '', text).strip()
-                logger.warning("Stripped spurious <ps> from single-part fragment")
+            if not orig_has_ps and ps_re.search(text):
+                cleaned = ps_re.sub('', text).strip()
+                logger.warning(f"Stripped spurious {ps_tag} from single-part fragment")
                 return cleaned
             return text
 
@@ -1302,7 +1385,7 @@ class TranslationOrchestrator:
             return text
 
         if fragment.get('_used_ps_marker', False):
-            trans_parts = [p.strip() for p in text.split('<ps>')]
+            trans_parts = [p.strip() for p in ps_re.split(text)]
             trans_parts = [p for p in trans_parts if p]
 
             if len(trans_parts) == n_parts:
@@ -1312,7 +1395,7 @@ class TranslationOrchestrator:
                     if i < len(original_separators):
                         result += original_separators[i]
                 logger.debug(
-                    f"Restored inline structure: {n_parts} parts via <ps> markers"
+                    f"Restored inline structure: {n_parts} parts via {ps_tag} markers"
                 )
                 return result
 
@@ -1320,16 +1403,16 @@ class TranslationOrchestrator:
                 dominant_sep = original_separators[0] if original_separators else '\n'
                 result = dominant_sep.join(trans_parts)
                 logger.warning(
-                    f"<ps> count mismatch: expected {n_parts}, got {len(trans_parts)} "
+                    f"{ps_tag} count mismatch: expected {n_parts}, got {len(trans_parts)} "
                     f"— joining with {repr(dominant_sep)}"
                 )
                 return result
 
             else:
-                flat = _re.sub(r'<ps>', '', text).strip()
+                flat = ps_re.sub('', text).strip()
                 logger.warning(
-                    f"LLM dropped all <ps> markers (expected {n_parts} parts) "
-                    f"— returning flat text without spurious <ps>"
+                    f"LLM dropped all {ps_tag} markers (expected {n_parts} parts) "
+                    f"— returning flat text without spurious {ps_tag}"
                 )
                 return flat
 
@@ -1425,7 +1508,7 @@ class TranslationOrchestrator:
 
                 if processing_mode == 'inline':
                     fragment['_used_ps_marker'] = True
-                    core_text = '<ps>'.join(p.strip() for p in original_parts if p.strip())
+                    core_text = f"<{self.tag_profile.paragraph_separator}>".join(p.strip() for p in original_parts if p.strip())
                 else:
                     fragment['_used_ps_marker'] = False
                     core_text = ' '.join(p.strip() for p in original_parts if p.strip())
@@ -1509,6 +1592,9 @@ class TranslationOrchestrator:
                     top_k=top_k
                 )
 
+                raw_response = getattr(self.llm_client, 'last_raw_response', '') or response
+                fragment['llm_raw_response'] = raw_response
+
                 elapsed = time.time() - start_time
 
                 logger.info("")
@@ -1516,7 +1602,7 @@ class TranslationOrchestrator:
                 logger.info(f"✅ LLM RESPONSE - Fragment {fragment.get('index', '?')+1} - Attempt {attempt_num}")
                 logger.info("=" * 80)
                 logger.info(f"Response time: {elapsed:.1f}s")
-                logger.info(f"Response length: {len(response)} chars")
+                logger.info(f"Response length: {len(response)} chars (raw: {len(raw_response)} chars)")
                 logger.info("-" * 80)
                 if len(response) > 500:
                     logger.info(f"{response[:250]}")
@@ -1552,6 +1638,13 @@ class TranslationOrchestrator:
 
             cleaned = self._restore_paragraph_structure(cleaned, fragment)
 
+            if self.split_fn:
+                try:
+                    _split_lines = self.split_fn(cleaned, fragment)
+                    cleaned = '\n'.join(_split_lines)
+                except Exception as _split_err:
+                    logger.warning(f"split_fn failed: {_split_err}")
+
             if self.formatting_sync:
                 cleaned = self.formatting_sync.sync_formatting(
                     original=fragment['original_text'],
@@ -1577,7 +1670,7 @@ class TranslationOrchestrator:
                 fragment['is_translated'] = True
 
                 has_mismatch, mismatch_flags = mismatch_checker.check_mismatch(fragment)
-                auto_fix_manager.record_attempt(cleaned, mismatch_flags)
+                auto_fix_manager.record_attempt(cleaned, mismatch_flags, raw_response=raw_response)
 
                 if has_mismatch:
                     error_count = sum(1 for v in mismatch_flags.values() if v)
@@ -1618,6 +1711,7 @@ class TranslationOrchestrator:
                         logger.warning(f"Best result: Attempt {best_attempt_num} ({best_errors} errors)")
                         logger.warning("=" * 80)
                         logger.warning("")
+                        fragment['llm_raw_response'] = auto_fix_manager.best_attempt.get('raw_response') or raw_response
                         return best
                     else:
                         logger.warning(f"⚠ Auto-fix FAILED - returning last attempt")
@@ -1642,8 +1736,14 @@ class TranslationOrchestrator:
     def _extract_translation_from_response(self, response: str) -> str:
         text = response.strip()
 
+        custom_tag = self.response_wrapper_tag
+        if custom_tag and custom_tag.lower() not in ('translated', 'translation'):
+            tags_pattern = f'(?:{re.escape(custom_tag)}|translated|translation)'
+        else:
+            tags_pattern = r'(?:translated|translation)'
+
         matches = re.findall(
-            r'<(?:translated|translation)>(.*?)</(?:translated|translation)>',
+            rf'<{tags_pattern}>(.*?)</{tags_pattern}>',
             text,
             re.DOTALL | re.IGNORECASE
         )
@@ -1651,7 +1751,7 @@ class TranslationOrchestrator:
         if matches:
             best = max(matches, key=len)
             text = best.strip()
-            logger.debug("Extracted text from <translated>/<translation> tags")
+            logger.debug(f"Extracted text from <{tags_pattern}> tags")
 
         if '\\n' in text:
             text = text.replace('\\n', '\n')
