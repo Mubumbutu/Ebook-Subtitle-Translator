@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from ebooklib import epub
 from epub_utils import NAMESPACES, read_epub
 from lxml import etree
+from app_utils import TagProfile
 from PyQt6.QtCore import pyqtSignal, QThread
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -37,15 +38,16 @@ class FileProcessor(ABC):
 class EPUBProcessor(FileProcessor):
     def __init__(self, app_settings: dict):
         self.app_settings = app_settings
+        self.tag_profile = TagProfile.from_settings(app_settings)
         self.book = None
         self.paragraphs = []
         self.image_items = []
         self.css_class_styles = {}
- 
+
         self.skip_inline_tags = app_settings.get('skip_inline_tags', {})
- 
+
         self.PRIORITY_TAGS = ['p', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']
- 
+
         self.NON_INLINE_ELEMENTS = {
             'address', 'blockquote', 'dialog', 'div', 'figure', 'figcaption',
             'footer', 'header', 'legend', 'main', 'p', 'pre', 'search', 'article',
@@ -53,15 +55,15 @@ class EPUBProcessor(FileProcessor):
             'section', 'dd', 'dl', 'dt', 'menu', 'ol', 'ul', 'table', 'caption',
             'colgroup', 'col', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'li'
         }
- 
+
         self.NOISE_TAGS = ['rt', 'rp']
- 
+
         self.RESERVE_TAGS = [
             'img', 'code', 'br', 'hr', 'sub', 'sup', 'kbd',
             'abbr', 'wbr', 'var', 'canvas', 'svg', 'script',
             'style', 'math'
         ]
- 
+
         logger.info(f"EPUBProcessor initialized with {len(self.RESERVE_TAGS)} structural reserve tags, "
                     f"skip_inline_tags: {self.skip_inline_tags}")
  
@@ -312,27 +314,27 @@ class EPUBProcessor(FileProcessor):
             raise
  
     def _is_non_translatable_content(self, text: str) -> bool:
-        text_no_placeholders = re.sub(r'<id_\d{2}>', '', text)
-        text_no_placeholders = re.sub(r'</?p_\d{2}>', '', text_no_placeholders)
- 
+        text_no_placeholders = self.tag_profile.reserve_open_re().sub('', text)
+        text_no_placeholders = self.tag_profile.all_placeholders_re().sub('', text_no_placeholders)
+
         text_stripped = text_no_placeholders.strip()
- 
+
         if not text_stripped:
             logger.debug("Non-translatable: empty after removing placeholders")
             return True
- 
+
         if re.match(r'^[\s\d\.,!?:;…\-–—\'\"\u201e\u201d\u201a\u2019]+$', text_stripped):
             logger.debug(f"Non-translatable: only special chars: {repr(text_stripped)}")
             return True
- 
+
         if re.match(r'^[\s\*•–—]+$', text_stripped):
             logger.debug(f"Non-translatable: chapter separator: {repr(text_stripped)}")
             return True
- 
+
         if re.match(r'^([\*•–—])\s*(\1\s*)+$', text_stripped):
             logger.debug(f"Non-translatable: repeated special chars: {repr(text_stripped)}")
             return True
- 
+
         return False
  
     def _extract_elements_lxml(self, root, item_href, seen):
@@ -542,24 +544,25 @@ class EPUBProcessor(FileProcessor):
             self._process_element_legacy(element, item_href, seen)
  
     def _process_element_legacy(self, element, item_href, seen):
+        tp = self.tag_profile
         tag_name = etree.QName(element).localname
- 
+
         if element.get('id') is None:
             element.set('id', f"trans_{uuid.uuid4()}")
- 
+
         element_id = element.get('id')
         element_copy = copy.deepcopy(element)
- 
+
         for noise_tag in self.NOISE_TAGS:
             for noise_elem in element_copy.xpath(f'.//x:{noise_tag}', namespaces=NAMESPACES):
                 parent = noise_elem.getparent()
                 if parent is not None:
                     parent.remove(noise_elem)
- 
+
         reserve_elements = []
-        placeholder_pattern = '<id_{:02d}>'
+        placeholder_pattern = f'<{tp.reserve_prefix}{{:02d}}>'
         reserve_counter = 0
- 
+
         for reserve_tag in self.RESERVE_TAGS:
             for reserve_elem in element_copy.xpath(f'.//x:{reserve_tag}', namespaces=NAMESPACES):
                 reserve_html = etree.tostring(
@@ -570,10 +573,10 @@ class EPUBProcessor(FileProcessor):
                 )
                 reserve_html = re.sub(r'\s+xmlns(?::\w+)?="[^"]*"', '', reserve_html)
                 reserve_elements.append(reserve_html)
- 
-                placeholder = placeholder_pattern.format(reserve_counter)
+
+                placeholder = tp.reserve_placeholder(reserve_counter)
                 reserve_counter += 1
- 
+
                 parent = reserve_elem.getparent()
                 if parent is not None:
                     tail = reserve_elem.tail or ''
@@ -587,34 +590,34 @@ class EPUBProcessor(FileProcessor):
                         space_before = '' if (not existing or existing[-1].isspace()) else ' '
                         parent.text = existing + space_before + placeholder + tail
                     parent.remove(reserve_elem)
- 
+
         clean_text = self._get_element_text(element_copy)
- 
+
         if not clean_text or not clean_text.strip():
             return
- 
+
         prefix_tags, suffix_tags, clean_text = self._extract_boundary_reserve_tags(clean_text)
- 
+
         is_non_translatable = self._is_non_translatable_content(clean_text)
- 
+
         if is_non_translatable:
             logger.debug(f"Marking element {element_id} as non-translatable (will be preserved in EPUB)")
- 
+
         key = (item_href, element_id)
         if key in seen:
             return
         seen.add(key)
- 
+
         original_html = etree.tostring(
             element,
             encoding='unicode',
             method='xml',
             pretty_print=False
         )
- 
+
         HEADING_LOCAL_NAMES = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
         element_type = 'heading' if tag_name in HEADING_LOCAL_NAMES else tag_name
- 
+
         para = {
             "id": element_id,
             "original_text": clean_text,
@@ -631,7 +634,7 @@ class EPUBProcessor(FileProcessor):
             "suffix_reserve_tags": suffix_tags,
             "is_non_translatable": is_non_translatable
         }
- 
+
         style_parts = {}
         elem_align = (element.get('align') or '').strip().lower()
         if elem_align in ('center', 'left', 'right', 'justify'):
@@ -653,42 +656,43 @@ class EPUBProcessor(FileProcessor):
                     style_parts[prop] = val
         if style_parts:
             para['kindle_style'] = '; '.join(f'{k}:{v}' for k, v in style_parts.items())
- 
+
         self.paragraphs.append(para)
- 
+
         logger.debug(f"[LEGACY] Processed element {element_id}: {len(reserve_elements)} reserve, "
                      f"{len(prefix_tags)} prefix tags, {len(suffix_tags)} suffix tags, "
                      f"non-translatable={is_non_translatable}")
  
     def _process_element_new(self, element, item_href, seen):
+        tp = self.tag_profile
         tag_name = etree.QName(element).localname
- 
+
         if element.get('id') is None:
             element.set('id', f"trans_{uuid.uuid4()}")
- 
+
         element_id = element.get('id')
         element_copy = copy.deepcopy(element)
- 
+
         for noise_tag in self.NOISE_TAGS:
             for noise_elem in element_copy.xpath(f'.//x:{noise_tag}', namespaces=NAMESPACES):
                 parent = noise_elem.getparent()
                 if parent is not None:
                     parent.remove(noise_elem)
- 
+
         reserve_elements = []
-        placeholder_pattern = '<id_{:02d}>'
+        placeholder_pattern = f'<{tp.reserve_prefix}{{:02d}}>'
         reserve_counter = 0
- 
+
         for reserve_tag in self.RESERVE_TAGS:
             for reserve_elem in element_copy.xpath(f'.//x:{reserve_tag}', namespaces=NAMESPACES):
                 reserve_elem_copy = copy.deepcopy(reserve_elem)
                 reserve_elem_copy.tail = None
                 reserve_html = etree.tostring(reserve_elem_copy, encoding='unicode', method='xml')
                 reserve_elements.append(reserve_html)
- 
-                placeholder = placeholder_pattern.format(reserve_counter)
+
+                placeholder = tp.reserve_placeholder(reserve_counter)
                 reserve_counter += 1
- 
+
                 parent = reserve_elem.getparent()
                 if parent is not None:
                     tail = reserve_elem.tail or ''
@@ -698,17 +702,17 @@ class EPUBProcessor(FileProcessor):
                     else:
                         parent.text = (parent.text or '') + placeholder + tail
                     parent.remove(reserve_elem)
- 
+
         self._remove_useless_spans(element_copy)
- 
+
         inline_formatting_map = {}
         inline_counter = reserve_counter
- 
+
         INLINE_FORMATTING_TAGS = [
             'a', 'i', 'b', 'em', 'strong',
             'u', 'sup', 'sub', 'small', 'span'
         ]
- 
+
         clean_text, inline_formatting_map, final_counter = \
             self._replace_inline_formatting_with_placeholders(
                 element_copy,
@@ -716,75 +720,75 @@ class EPUBProcessor(FileProcessor):
                 inline_counter,
                 placeholder_pattern
             )
- 
+
         clean_text = self._cleanup_empty_placeholders(clean_text)
- 
+
         clean_text, inline_formatting_map = \
             self._flatten_placeholder_nesting(clean_text, inline_formatting_map)
- 
+
         clean_text, non_translatable_map = \
             self._extract_non_translatable_placeholders(
                 clean_text,
                 inline_formatting_map
             )
- 
+
         clean_text = self._cleanup_empty_placeholders(clean_text)
- 
+
         if not clean_text or not clean_text.strip():
             return
- 
+
         prefix_tags, suffix_tags, clean_text = \
             self._extract_boundary_reserve_tags(clean_text)
- 
+
         is_non_translatable = self._is_non_translatable_content(clean_text)
- 
+
         if is_non_translatable:
             logger.debug(f"Marking element {element_id} as non-translatable")
- 
+
         auto_wrap_tags = self._detect_auto_wrap_tags(
             clean_text,
             inline_formatting_map
         )
- 
+
         if auto_wrap_tags:
             clean_text = self._strip_outer_placeholders(
                 clean_text,
                 auto_wrap_tags
             )
             logger.debug(f"Auto-wrap detected: {len(auto_wrap_tags)} tag(s)")
- 
-        used_ids = set(int(m) for m in re.findall(r'<p_(\d{2})>', clean_text))
+
+        used_ids = set(int(m) for m in tp.inline_open_re().findall(clean_text))
         non_translatable_ids = set(non_translatable_map.keys())
- 
+
         auto_wrap_ids = set(tag_info['elem_id'] for tag_info in auto_wrap_tags) if auto_wrap_tags else set()
         keep_ids = used_ids | non_translatable_ids | auto_wrap_ids
- 
+
         inline_formatting_map = {
             k: v for k, v in inline_formatting_map.items()
             if k in keep_ids
         }
- 
+
         logger.debug(
             f"Pruned inline_formatting_map: {len(inline_formatting_map)} entries "
             f"(used: {sorted(used_ids)}, nt: {sorted(non_translatable_ids)}, "
             f"auto_wrap: {sorted(auto_wrap_ids)})"
         )
- 
+
         key = (item_href, element_id)
         if key in seen:
             return
         seen.add(key)
- 
+
         original_html = etree.tostring(
             element,
             encoding='unicode',
             method='xml',
             pretty_print=False
         )
- 
+
         HEADING_LOCAL_NAMES = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
         element_type = 'heading' if tag_name in HEADING_LOCAL_NAMES else tag_name
- 
+
         para = {
             "id": element_id,
             "original_text": clean_text,
@@ -803,7 +807,7 @@ class EPUBProcessor(FileProcessor):
             "suffix_reserve_tags": suffix_tags,
             "is_non_translatable": is_non_translatable
         }
- 
+
         style_parts = {}
         elem_align = (element.get('align') or '').strip().lower()
         if elem_align in ('center', 'left', 'right', 'justify'):
@@ -825,10 +829,10 @@ class EPUBProcessor(FileProcessor):
                     style_parts[prop] = val
         if style_parts:
             para['kindle_style'] = '; '.join(f'{k}:{v}' for k, v in style_parts.items())
- 
+
         if auto_wrap_tags:
             para['auto_wrap_tags'] = auto_wrap_tags
- 
+
         self.paragraphs.append(para)
  
     def _remove_useless_spans(self, element):
@@ -883,28 +887,29 @@ class EPUBProcessor(FileProcessor):
             logger.info(f"✓ Removed {removed_count} useless <span> wrapper(s)")
  
     def _replace_inline_formatting_with_placeholders(self, element, inline_tags, start_counter, placeholder_pattern):
+        tp = self.tag_profile
         formatting_map = {}
         counter = start_counter
- 
+
         STRUCTURAL_SPAN_CLASSES = {
             'first-letter',
             'last-word',
             'item-number',
             'element-number',
         }
- 
+
         replacements = []
- 
+
         tags_to_process = []
         for tag in inline_tags:
             if self.skip_inline_tags.get(tag, False):
                 logger.debug(f"Skipping <{tag}> tags (user preference)")
             else:
                 tags_to_process.append(tag)
- 
+
         if not tags_to_process:
             logger.warning("All inline formatting tags are skipped - no placeholders will be created")
- 
+
         for tag in tags_to_process:
             for elem in element.xpath(f'.//x:{tag}', namespaces=NAMESPACES):
                 if tag == 'span':
@@ -912,12 +917,12 @@ class EPUBProcessor(FileProcessor):
                     if epub_type == 'pagebreak':
                         logger.debug(f"Skipping pagebreak span")
                         continue
- 
+
                     class_attr = elem.get('class')
                     if class_attr in STRUCTURAL_SPAN_CLASSES:
                         logger.debug(f"Skipping structural span: class='{class_attr}'")
                         continue
- 
+
                     if not elem.attrib:
                         text = (elem.text or '').strip()
                         if len(text) == 1 and text.isalpha():
@@ -927,14 +932,14 @@ class EPUBProcessor(FileProcessor):
                                 if len(children) > 0 and children[0] == elem:
                                     logger.debug(f"Skipping drop cap span: '{text}'")
                                     continue
- 
+
                 elem_id = counter
-                opening = "<p_{:02d}>".format(elem_id)
-                closing = "</p_{:02d}>".format(elem_id)
- 
+                opening = tp.inline_open_placeholder(elem_id)
+                closing = tp.inline_close_placeholder(elem_id)
+
                 tag_name = etree.QName(elem).localname
                 attributes = dict(elem.attrib)
- 
+
                 prev_sibling = elem.getprevious()
                 if prev_sibling is not None:
                     preceding_text = prev_sibling.tail or ''
@@ -942,15 +947,15 @@ class EPUBProcessor(FileProcessor):
                     parent_elem = elem.getparent()
                     preceding_text = (parent_elem.text or '') if parent_elem is not None else ''
                 has_leading_space = bool(preceding_text) and preceding_text[-1] in ' \t\n\r\u00a0'
- 
+
                 elem_tail = elem.tail or ''
                 has_trailing_space = bool(elem_tail) and elem_tail[0] in ' \t\n\r\u00a0'
- 
+
                 logger.debug(
                     f"  elem_id={elem_id} <{tag_name}> "
                     f"has_leading_space={has_leading_space}, has_trailing_space={has_trailing_space}"
                 )
- 
+
                 formatting_map[elem_id] = {
                     'tag': tag_name,
                     'attributes': attributes,
@@ -959,12 +964,12 @@ class EPUBProcessor(FileProcessor):
                     'has_leading_space': has_leading_space,
                     'has_trailing_space': has_trailing_space,
                 }
- 
+
                 replacements.append((elem, opening, closing, elem_id))
                 counter += 1
- 
+
         result_text = self._serialize_element_with_placeholders(element, replacements)
- 
+
         return result_text, formatting_map, counter
  
     def _serialize_element_with_placeholders(self, element, replacements):
@@ -1005,132 +1010,153 @@ class EPUBProcessor(FileProcessor):
         return process_node(element)
  
     def _cleanup_empty_placeholders(self, text):
+        tp = self.tag_profile
+        ip = re.escape(tp.inline_prefix)
+        pattern = rf'<{ip}(\d{{2}})></{ip}\1>'
         original_text = text
         max_iterations = 10
- 
+
         for iteration in range(max_iterations):
-            pattern = r'<p_(\d{2})></p_\1>'
             new_text = re.sub(pattern, '', text)
- 
+
             if new_text == text:
                 break
- 
+
             text = new_text
- 
+
         if text != original_text:
-            original_count = original_text.count('<p_')
-            new_count = text.count('<p_')
+            open_marker = f'<{tp.inline_prefix}'
+            original_count = original_text.count(open_marker)
+            new_count = text.count(open_marker)
             removed = (original_count - new_count) // 2
             logger.info(f"✓ Removed {removed} empty placeholder pair(s)")
- 
+
         return text
  
     def _flatten_placeholder_nesting(self, text, formatting_map):
-        pattern = r'<p_(\d{2})>\s*(<p_\d{2}>.*?</p_\d{2}>)\s*</p_\1>'
- 
+        tp = self.tag_profile
+        ip = re.escape(tp.inline_prefix)
+        pattern = rf'<{ip}(\d{{2}})>\s*(<{ip}\d{{2}}>.*?</{ip}\d{{2}}>)\s*</{ip}\1>'
+        inline_open_re = tp.inline_open_re()
+
         max_iterations = 5
         removed_ids = set()
- 
+
         for iteration in range(max_iterations):
             matches = list(re.finditer(pattern, text, re.DOTALL))
- 
+
             if not matches:
                 break
- 
+
             for match in reversed(matches):
                 outer_id_str = match.group(1)
                 inner_content = match.group(2)
- 
+
                 outer_id = int(outer_id_str)
- 
+
                 if outer_id not in formatting_map:
                     continue
- 
+
                 outer_info = formatting_map[outer_id]
                 outer_tag = outer_info['tag']
                 outer_attrs = outer_info['attributes']
- 
+
                 should_remove = False
- 
+
                 if outer_tag == 'span' and not outer_attrs:
                     should_remove = True
-                    logger.debug(f"Flattening: <p_{outer_id_str}> is empty <span> → REMOVE")
- 
-                inner_match = re.match(r'<p_(\d{2})>', inner_content)
+                    logger.debug(
+                        f"Flattening: {tp.inline_open_placeholder(outer_id)} is empty <span> → REMOVE"
+                    )
+
+                inner_match = inline_open_re.match(inner_content)
                 if inner_match and not should_remove:
                     inner_id = int(inner_match.group(1))
- 
+
                     if inner_id in formatting_map:
                         inner_info = formatting_map[inner_id]
- 
+
                         if (outer_tag == inner_info['tag'] and
                             outer_attrs == inner_info['attributes']):
                             should_remove = True
-                            logger.debug(f"Flattening: <p_{outer_id_str}> duplicates <p_{inner_id}> → REMOVE")
- 
+                            logger.debug(
+                                f"Flattening: {tp.inline_open_placeholder(outer_id)} duplicates "
+                                f"{tp.inline_open_placeholder(inner_id)} → REMOVE"
+                            )
+
                 if should_remove:
                     text = text[:match.start()] + inner_content + text[match.end():]
                     removed_ids.add(outer_id)
- 
+
         for tag_id in removed_ids:
             if tag_id in formatting_map:
                 del formatting_map[tag_id]
-                logger.debug(f"✓ Removed <p_{tag_id:02d}> from formatting_map")
- 
+                logger.debug(f"✓ Removed {tp.inline_open_placeholder(tag_id)} from formatting_map")
+
         if removed_ids:
             logger.info(f"✓ Flattened {len(removed_ids)} nested placeholder(s)")
- 
+
         return text, formatting_map
  
     def _extract_non_translatable_placeholders(self, text, formatting_map):
+        tp = self.tag_profile
+        ip = re.escape(tp.inline_prefix)
         NON_TRANSLATABLE_PATTERN = r'^[\s\.,!?:;…]*$'
-        placeholder_pattern = r'<p_(\d{2})>(.*?)</p_\1>'
- 
+        placeholder_pattern = rf'<{ip}(\d{{2}})>(.*?)</{ip}\1>'
+
         non_translatable_map = {}
- 
+
         def replace_with_marker(match):
             tag_id = int(match.group(1))
             content = match.group(2)
- 
+
             if re.match(NON_TRANSLATABLE_PATTERN, content):
                 non_translatable_map[tag_id] = {
                     'full_match': match.group(0),
                     'content': content
                 }
                 logger.debug(f"Marked non-translatable: {repr(match.group(0))}")
-                return f'<nt_{tag_id:02d}/>'
+                return tp.non_trans_placeholder(tag_id)
             else:
                 return match.group(0)
- 
+
         clean_text = re.sub(placeholder_pattern, replace_with_marker, text, flags=re.DOTALL)
- 
+
         if non_translatable_map:
             logger.info(f"✓ Marked {len(non_translatable_map)} non-translatable placeholder(s) with markers")
             for tag_id, info in non_translatable_map.items():
-                logger.debug(f"  p_{tag_id:02d} → <nt_{tag_id:02d}/>: {repr(info['content'])}")
- 
+                logger.debug(
+                    f"  {tp.inline_open_placeholder(tag_id)} → "
+                    f"{tp.non_trans_placeholder(tag_id)}: {repr(info['content'])}"
+                )
+
         return clean_text, non_translatable_map
  
     def _detect_auto_wrap_tags(self, text, formatting_map):
         if not formatting_map:
             return None
- 
+
+        tp = self.tag_profile
+        ip = re.escape(tp.inline_prefix)
+        wrap_pattern = rf'^<{ip}(\d{{2}})>(.*)</{ip}\1>$'
+        any_inline_pattern = rf'</?{ip}\d{{2}}>'
+
         wrap_tags = []
         working_text = text.strip()
- 
+
         while True:
-            match = re.match(r'^<p_(\d{2})>(.*)</p_\1>$', working_text, re.DOTALL)
- 
+            match = re.match(wrap_pattern, working_text, re.DOTALL)
+
             if not match:
                 break
- 
+
             elem_id_str = match.group(1)
             elem_id = int(elem_id_str)
             inner_text = match.group(2)
- 
+
             if elem_id not in formatting_map:
                 break
- 
+
             info = formatting_map[elem_id]
             wrap_tags.append({
                 'elem_id': elem_id,
@@ -1139,15 +1165,15 @@ class EPUBProcessor(FileProcessor):
                 'tag': info['tag'],
                 'attributes': info['attributes']
             })
- 
+
             working_text = inner_text.strip()
- 
-        if wrap_tags and not re.search(r'</?p_\d{2}>', working_text):
+
+        if wrap_tags and not re.search(any_inline_pattern, working_text):
             logger.debug(f"✓ Auto-wrap detected: {len(wrap_tags)} tag(s)")
             for idx, tag_info in enumerate(wrap_tags):
                 logger.debug(f"  [{idx}] <{tag_info['tag']}> (id={tag_info['elem_id']})")
             return wrap_tags
- 
+
         return None
  
     def _strip_outer_placeholders(self, text, auto_wrap_tags):
@@ -1164,15 +1190,16 @@ class EPUBProcessor(FileProcessor):
         return working_text
  
     def _extract_boundary_reserve_tags(self, text):
+        tp = self.tag_profile
         prefix_tags = []
         suffix_tags = []
         clean_text = text
- 
-        tag_pattern = r'<id_\d{2}>'
- 
+
+        tag_pattern = rf'<{re.escape(tp.reserve_prefix)}\d{{2}}>'
+
         while True:
             clean_text = clean_text.lstrip()
- 
+
             match = re.match(tag_pattern, clean_text)
             if match:
                 tag = match.group(0)
@@ -1180,10 +1207,10 @@ class EPUBProcessor(FileProcessor):
                 clean_text = clean_text[len(tag):]
             else:
                 break
- 
+
         while True:
             clean_text = clean_text.rstrip()
- 
+
             match = re.search(tag_pattern + r'$', clean_text)
             if match:
                 tag = match.group(0)
@@ -1191,12 +1218,12 @@ class EPUBProcessor(FileProcessor):
                 clean_text = clean_text[:-len(tag)]
             else:
                 break
- 
+
         clean_text = clean_text.strip()
- 
+
         if prefix_tags or suffix_tags:
             logger.debug(f"Extracted boundary tags: prefix={prefix_tags}, suffix={suffix_tags}")
- 
+
         return prefix_tags, suffix_tags, clean_text
 
 class SRTProcessor(FileProcessor):
@@ -1345,6 +1372,180 @@ class SRTProcessor(FileProcessor):
             offset += len(match.group(0))
 
         return clean_line, tags_dict
+
+class ASSProcessor(FileProcessor):
+    def get_file_type(self) -> str:
+        return "ass"
+
+    @staticmethod
+    def _ass_to_srt_time(ass_time: str) -> str:
+        try:
+            h, m, s_frac = ass_time.strip().split(':')
+            if '.' in s_frac:
+                s, frac = s_frac.split('.')
+            else:
+                s, frac = s_frac, '00'
+            if len(frac) == 1:
+                ms = int(frac) * 100
+            elif len(frac) == 2:
+                ms = int(frac) * 10
+            elif len(frac) >= 3:
+                ms = int(frac[:3])
+            else:
+                ms = 0
+            return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{ms:03d}"
+        except Exception:
+            return "00:00:00,000"
+
+    @staticmethod
+    def _is_drawing(text_with_tags: str) -> bool:
+        return bool(re.search(r'\{\\p[1-9]\d*\}', text_with_tags))
+
+    def _parse_ass_text(self, text_with_tags: str):
+        if self._is_drawing(text_with_tags):
+            return text_with_tags, [], [text_with_tags], True
+
+        lines_text = ['']
+        tags_by_line = [{}]
+        current_line = 0
+        i = 0
+        while i < len(text_with_tags):
+            if text_with_tags[i] == '{':
+                end = text_with_tags.find('}', i)
+                if end != -1:
+                    tag = text_with_tags[i:end + 1]
+                    pos_in_line = len(lines_text[current_line])
+                    if pos_in_line not in tags_by_line[current_line]:
+                        tags_by_line[current_line][pos_in_line] = []
+                    tags_by_line[current_line][pos_in_line].append(tag)
+                    i = end + 1
+                    continue
+            if (i + 1 < len(text_with_tags)
+                    and text_with_tags[i] == '\\'
+                    and text_with_tags[i + 1] in 'Nn'):
+                lines_text.append('')
+                tags_by_line.append({})
+                current_line += 1
+                i += 2
+                continue
+            lines_text[current_line] += text_with_tags[i]
+            i += 1
+
+        clean_text = '\n'.join(lines_text)
+        return clean_text, tags_by_line, lines_text, False
+
+    def load(self, path: str) -> Tuple[List[Dict], None]:
+        encodings_to_try = ['utf-8', 'utf-8-sig', 'windows-1250', 'iso-8859-2', 'cp1252', 'latin1']
+        content = None
+        used_encoding = None
+        for encoding in encodings_to_try:
+            try:
+                with open(path, 'r', encoding=encoding) as f:
+                    content = f.read()
+                used_encoding = encoding
+                logger.info(f"Successfully loaded ASS file with encoding: {encoding}")
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+            except Exception as e:
+                logger.warning(f"Error loading ASS with {encoding}: {e}")
+                continue
+
+        if content is None:
+            raise ValueError(
+                f"Failed to load ASS file. Tried encodings: {', '.join(encodings_to_try)}"
+            )
+
+        try:
+            header_lines = []
+            for line in content.split('\n'):
+                if line.strip() == '[Events]':
+                    break
+                header_lines.append(line)
+            header_text = '\n'.join(header_lines).rstrip() + '\n'
+
+            paragraphs = []
+            in_events = False
+
+            for line in content.split('\n'):
+                line_stripped = line.strip()
+                if line_stripped == '[Events]':
+                    in_events = True
+                    continue
+                if not in_events:
+                    continue
+                if not line_stripped.startswith('Dialogue:'):
+                    continue
+
+                parts = line_stripped[len('Dialogue:'):].split(',', 9)
+                if len(parts) < 10:
+                    continue
+
+                layer = parts[0].strip()
+                start = parts[1].strip()
+                end = parts[2].strip()
+                style = parts[3].strip()
+                name = parts[4].strip()
+                margin_l = parts[5].strip()
+                margin_r = parts[6].strip()
+                margin_v = parts[7].strip()
+                effect = parts[8].strip()
+                text_with_tags = parts[9]
+
+                timestamp = (
+                    f"{self._ass_to_srt_time(start)} --> "
+                    f"{self._ass_to_srt_time(end)}"
+                )
+
+                clean_text, tags_by_line, clean_lines, is_drawing = \
+                    self._parse_ass_text(text_with_tags)
+
+                block_num = str(len(paragraphs) + 1)
+
+                paragraphs.append({
+                    'id': block_num,
+                    'original_text': clean_text,
+                    'translated_text': '',
+                    'is_translated': False,
+                    'item_href': path,
+                    'element_type': 'subtitle_block',
+                    'timestamp': timestamp,
+                    'subtitle_block': block_num,
+                    'has_mismatch': False,
+                    'srt_tags_by_line': [],
+                    'original_clean_lines': clean_lines,
+                    'original_line_count': len(clean_lines),
+                    'original_split_positions': [],
+                    'original_lines_with_tags': clean_lines,
+                    'ass_layer': layer,
+                    'ass_start': start,
+                    'ass_end': end,
+                    'ass_style': style,
+                    'ass_name': name,
+                    'ass_margin_l': margin_l,
+                    'ass_margin_r': margin_r,
+                    'ass_margin_v': margin_v,
+                    'ass_effect': effect,
+                    'ass_text_with_tags': text_with_tags,
+                    'ass_tags_by_line': tags_by_line,
+                    'ass_is_drawing': is_drawing,
+                    'is_non_translatable': is_drawing,
+                })
+
+            if not paragraphs:
+                raise ValueError("No dialogue events found in ASS file")
+
+            paragraphs[0]['ass_header_text'] = header_text
+
+            logger.info(
+                f"Loaded {len(paragraphs)} dialogue events from ASS "
+                f"(Encoding: {used_encoding})"
+            )
+            return paragraphs, None
+
+        except Exception as e:
+            logger.error(f"Failed to parse ASS file: {e}", exc_info=True)
+            raise
 
 class TXTProcessor(FileProcessor):
     MAX_CHARS_PER_FRAGMENT = 6000
@@ -1923,6 +2124,7 @@ class PDFProcessor(FileProcessor):
 class MobiProcessor(FileProcessor):
     def __init__(self, app_settings: dict):
         self.app_settings = app_settings
+        self.tag_profile = TagProfile.from_settings(app_settings)
         self.original_kindle_path = None
         self._preview_tempdir = None
         self.image_items = []
@@ -1972,7 +2174,7 @@ class MobiProcessor(FileProcessor):
             '.bmp': 'image/bmp', '.webp': 'image/webp',
         }
         use_inline = self.app_settings.get('use_inline_formatting', True)
-        placeholder_pattern = '<p_{:02d}>'
+        placeholder_pattern = f'<{self.tag_profile.reserve_prefix}{{:02d}}>'
         INLINE_TAGS = {'b', 'strong', 'i', 'em', 'u', 'span', 'small', 'a', 'font'}
         HEADING_TAGS = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
         BLOCK_TAGS = {
@@ -2323,7 +2525,7 @@ class MobiProcessor(FileProcessor):
                                 if val and val not in pending_anchor_ids:
                                     pending_anchor_ids.append(val)
                     continue
-                actual_text = re.sub(r'</?p_\d{2}>', '', clean_text).strip()
+                actual_text = self.tag_profile.inline_close_re().sub('', self.tag_profile.inline_open_re().sub('', clean_text)).strip()
                 if not actual_text:
                     if elem_id_attr and elem_id_attr not in pending_anchor_ids:
                         pending_anchor_ids.append(elem_id_attr)
@@ -2395,6 +2597,7 @@ class MobiProcessor(FileProcessor):
         return paragraphs
 
     def _extract_html_inline(self, element, inline_tags: set, placeholder_pattern: str, css_class_styles: dict = None):
+        tp = self.tag_profile
         INLINE_TAG_MAP = {
             'b': 'b', 'strong': 'b', 'i': 'i', 'em': 'i',
             'u': 'u', 'span': 'span', 'small': 'small', 'a': 'a',
@@ -2466,8 +2669,8 @@ class MobiProcessor(FileProcessor):
                     filtered_attrs['style'] = '; '.join(f'{k}:{v}' for k, v in class_styles.items())
 
             elem_id = counter
-            opening = '<p_{:02d}>'.format(elem_id)
-            closing = '</p_{:02d}>'.format(elem_id)
+            opening = tp.inline_open_placeholder(elem_id)
+            closing = tp.inline_close_placeholder(elem_id)
 
             inline_formatting_map[elem_id] = {
                 'tag': html_tag,
@@ -2540,6 +2743,7 @@ class MobiProcessor(FileProcessor):
 class AZW3Processor:
     def __init__(self, app_settings: dict):
         self.app_settings = app_settings
+        self.tag_profile = TagProfile.from_settings(app_settings)
         self.original_path = None
         self._preview_tempdir = None
         self.image_items: List[Dict] = []
@@ -2597,8 +2801,8 @@ class AZW3Processor:
             'background-color', 'letter-spacing', 'line-height',
         }
         self.KEEP_CSS_PROPS = {'text-align'}
-        self.PLACEHOLDER_PATTERN = '<p_{:02d}>'
-        self.RESERVE_PLACEHOLDER_PATTERN = '<id_{:02d}>'
+        self.PLACEHOLDER_PATTERN = f'<{self.tag_profile.inline_prefix}{{:02d}}>'
+        self.RESERVE_PLACEHOLDER_PATTERN = f'<{self.tag_profile.reserve_prefix}{{:02d}}>'
 
     def get_file_type(self) -> str:
         return "azw3"
@@ -3285,7 +3489,7 @@ class AZW3Processor:
                 clean_text, inline_map = self._html_extract_inline(elem, placeholder_pattern)
                 if not clean_text.strip():
                     continue
-                actual_text = re.sub(r'</?p_\d{2}>', '', clean_text).strip()
+                actual_text = self.tag_profile.inline_close_re().sub('', self.tag_profile.inline_open_re().sub('', clean_text)).strip()
                 if not actual_text:
                     continue
                 para = {
@@ -3346,6 +3550,7 @@ class AZW3Processor:
     def _html_extract_inline(self, element, placeholder_pattern: str) -> Tuple[str, Dict]:
         ATTRS_TO_KEEP = {'href', 'style', 'class', 'id', 'target', 'title', 'name'}
         VOID_TAGS = {'br', 'hr', 'wbr'}
+        tp = self.tag_profile
         inline_formatting_map = {}
         counter = 0
         replacements = []
@@ -3356,8 +3561,8 @@ class AZW3Processor:
                 continue
             html_tag = self.INLINE_TAG_MAP.get(child_tag, child_tag)
             elem_id = counter
-            opening = '<p_{:02d}>'.format(elem_id)
-            closing = '</p_{:02d}>'.format(elem_id)
+            opening = tp.inline_open_placeholder(elem_id)
+            closing = tp.inline_close_placeholder(elem_id)
             filtered_attrs = {k: v for k, v in (child.attrib or {}).items() if k in ATTRS_TO_KEEP}
             inline_formatting_map[elem_id] = {
                 'tag': html_tag,
@@ -3442,6 +3647,7 @@ class AZW3Processor:
         return False
 
     def _process_element_inline(self, element, item_href: str, seen: set, list_context=None):
+        tp = self.tag_profile
         tag_name = etree.QName(element).localname
         original_element_id = element.get('id')
         if original_element_id is None:
@@ -3462,7 +3668,7 @@ class AZW3Processor:
                 reserve_elem_copy.tail = None
                 reserve_html = etree.tostring(reserve_elem_copy, encoding='unicode', method='xml')
                 reserve_elements.append(reserve_html)
-                placeholder = self.RESERVE_PLACEHOLDER_PATTERN.format(reserve_counter)
+                placeholder = tp.reserve_placeholder(reserve_counter)
                 reserve_counter += 1
                 parent = reserve_elem.getparent()
                 if parent is not None:
@@ -3491,7 +3697,7 @@ class AZW3Processor:
         auto_wrap_tags = self._detect_auto_wrap_tags(clean_text, inline_formatting_map)
         if auto_wrap_tags:
             clean_text = self._strip_outer_placeholders(clean_text, auto_wrap_tags)
-        used_ids = set(int(m) for m in re.findall(r'<p_(\d{2})>', clean_text))
+        used_ids = set(int(m) for m in tp.inline_open_re().findall(clean_text))
         non_translatable_ids = set(non_translatable_map.keys())
         auto_wrap_ids = set(tag_info['elem_id'] for tag_info in auto_wrap_tags) if auto_wrap_tags else set()
         keep_ids = used_ids | non_translatable_ids | auto_wrap_ids
@@ -3514,7 +3720,7 @@ class AZW3Processor:
             'reserve_elements': reserve_elements,
             'inline_formatting_map': inline_formatting_map,
             'non_translatable_placeholders': non_translatable_map,
-            'placeholder_pattern': self.PLACEHOLDER_PATTERN,
+            'placeholder_pattern': self.RESERVE_PLACEHOLDER_PATTERN,
             'processing_mode': 'inline',
             'prefix_reserve_tags': prefix_tags,
             'suffix_reserve_tags': suffix_tags,
@@ -3542,6 +3748,7 @@ class AZW3Processor:
         self.paragraphs.append(para)
 
     def _process_element_legacy(self, element, item_href: str, seen: set, list_context=None):
+        tp = self.tag_profile
         tag_name = etree.QName(element).localname
         original_element_id = element.get('id')
         if original_element_id is None:
@@ -3561,7 +3768,7 @@ class AZW3Processor:
                 reserve_html = etree.tostring(reserve_elem, encoding='unicode', method='xml', with_tail=False)
                 reserve_html = re.sub(r'\s+xmlns(?::\w+)?="[^"]*"', '', reserve_html)
                 reserve_elements.append(reserve_html)
-                placeholder = self.RESERVE_PLACEHOLDER_PATTERN.format(reserve_counter)
+                placeholder = tp.reserve_placeholder(reserve_counter)
                 reserve_counter += 1
                 parent = reserve_elem.getparent()
                 if parent is not None:
@@ -3683,14 +3890,16 @@ class AZW3Processor:
             parent.remove(span)
 
     def _replace_inline_formatting_with_placeholders(self, element, start_counter: int) -> Tuple[str, Dict, int]:
-        _reserve_split = re.compile(r'(<id_\d{2}>)')
+        tp = self.tag_profile
+        _reserve_split = re.compile(rf'(<{re.escape(tp.reserve_prefix)}\d{{2}}>)')
+        _reserve_full = re.compile(rf'^<{re.escape(tp.reserve_prefix)}\d{{2}}>$')
 
         def _esc(s: str) -> str:
             if not s:
                 return s
             parts = _reserve_split.split(s)
             return ''.join(
-                part if re.match(r'^<id_\d{2}>$', part) else html_module.escape(part)
+                part if _reserve_full.match(part) else html_module.escape(part)
                 for part in parts
             )
 
@@ -3716,8 +3925,8 @@ class AZW3Processor:
                                 if children and children[0] == elem:
                                     continue
                 elem_id = counter
-                opening = '<p_{:02d}>'.format(elem_id)
-                closing = '</p_{:02d}>'.format(elem_id)
+                opening = tp.inline_open_placeholder(elem_id)
+                closing = tp.inline_close_placeholder(elem_id)
                 tag_name = etree.QName(elem).localname
                 attributes = {k: v for k, v in elem.attrib.items() if not k.startswith('{')}
                 prev_sibling = elem.getprevious()
@@ -3765,15 +3974,20 @@ class AZW3Processor:
         return process_node(element), formatting_map, counter
 
     def _cleanup_empty_placeholders(self, text: str) -> str:
+        ip = re.escape(self.tag_profile.inline_prefix)
+        pattern = rf'<{ip}(\d{{2}})>\s*</{ip}\1>'
         for _ in range(10):
-            new_text = re.sub(r'<p_(\d{2})>\s*</p_\1>', '', text)
+            new_text = re.sub(pattern, '', text)
             if new_text == text:
                 break
             text = new_text
         return text
 
     def _flatten_placeholder_nesting(self, text: str, formatting_map: Dict) -> Tuple[str, Dict]:
-        pattern = r'<p_(\d{2})>\s*(<p_\d{2}>.*?</p_\d{2}>)\s*</p_\1>'
+        tp = self.tag_profile
+        ip = re.escape(tp.inline_prefix)
+        pattern = rf'<{ip}(\d{{2}})>\s*(<{ip}\d{{2}}>.*?</{ip}\d{{2}}>)\s*</{ip}\1>'
+        inline_open_re = tp.inline_open_re()
         removed_ids = set()
         for _ in range(5):
             matches = list(re.finditer(pattern, text, re.DOTALL))
@@ -3789,7 +4003,7 @@ class AZW3Processor:
                 if outer_info['tag'] == 'span' and not outer_info['attributes']:
                     should_remove = True
                 else:
-                    inner_match = re.match(r'<p_(\d{2})>', inner_content)
+                    inner_match = inline_open_re.match(inner_content)
                     if inner_match:
                         inner_id = int(inner_match.group(1))
                         if inner_id in formatting_map:
@@ -3805,8 +4019,11 @@ class AZW3Processor:
         return text, formatting_map
 
     def _extract_non_translatable_placeholders(self, text: str, formatting_map: Dict) -> Tuple[str, Dict]:
+        tp = self.tag_profile
+        ip = re.escape(tp.inline_prefix)
         NON_TRANSLATABLE_PATTERN = r'^[\s\.,!?:;…]*$'
         non_translatable_map = {}
+
         def replace_with_marker(match):
             tag_id = int(match.group(1))
             content = match.group(2)
@@ -3815,18 +4032,22 @@ class AZW3Processor:
                     'full_match': match.group(0),
                     'content': content,
                 }
-                return f'<nt_{tag_id:02d}/>'
+                return tp.non_trans_placeholder(tag_id)
             return match.group(0)
-        clean_text = re.sub(r'<p_(\d{2})>(.*?)</p_\1>', replace_with_marker, text, flags=re.DOTALL)
+
+        clean_text = re.sub(rf'<{ip}(\d{{2}})>(.*?)</{ip}\1>', replace_with_marker, text, flags=re.DOTALL)
         return clean_text, non_translatable_map
 
     def _detect_auto_wrap_tags(self, text: str, formatting_map: Dict) -> Optional[List[Dict]]:
         if not formatting_map:
             return None
+        ip = re.escape(self.tag_profile.inline_prefix)
+        wrap_pattern = rf'^<{ip}(\d{{2}})>(.*)</{ip}\1>$'
+        any_inline_pattern = rf'</?{ip}\d{{2}}>'
         wrap_tags = []
         working_text = text.strip()
         while True:
-            match = re.match(r'^<p_(\d{2})>(.*)</p_\1>$', working_text, re.DOTALL)
+            match = re.match(wrap_pattern, working_text, re.DOTALL)
             if not match:
                 break
             elem_id = int(match.group(1))
@@ -3842,7 +4063,7 @@ class AZW3Processor:
                 'attributes': info['attributes'],
             })
             working_text = inner_text.strip()
-        if wrap_tags and not re.search(r'</?p_\d{2}>', working_text):
+        if wrap_tags and not re.search(any_inline_pattern, working_text):
             return wrap_tags
         return None
 
@@ -3859,7 +4080,7 @@ class AZW3Processor:
         prefix_tags = []
         suffix_tags = []
         clean_text = text
-        tag_pattern = r'<id_\d{2}>'
+        tag_pattern = rf'<{re.escape(self.tag_profile.reserve_prefix)}\d{{2}}>'
         while True:
             clean_text = clean_text.lstrip()
             match = re.match(tag_pattern, clean_text)
@@ -3879,8 +4100,8 @@ class AZW3Processor:
         return prefix_tags, suffix_tags, clean_text.strip()
 
     def _is_non_translatable_content(self, text: str) -> bool:
-        text_clean = re.sub(r'<id_\d{2}>', '', text)
-        text_clean = re.sub(r'</?p_\d{2}>', '', text_clean).strip()
+        text_clean = self.tag_profile.reserve_open_re().sub('', text)
+        text_clean = self.tag_profile.all_placeholders_re().sub('', text_clean).strip()
         if not text_clean:
             return True
         if re.match(r'^[\s\d\.,!?:;…\-–—\'\"\u201e\u201d\u201a\u2019]+$', text_clean):
@@ -3896,6 +4117,7 @@ class FB2Processor(FileProcessor):
  
     def __init__(self, app_settings: dict):
         self.app_settings = app_settings
+        self.tag_profile = TagProfile.from_settings(app_settings)
         self.original_fb2_path = None
         self.image_items = []
         self.book_language = 'en'
@@ -3947,7 +4169,8 @@ class FB2Processor(FileProcessor):
  
     def _extract_fb2_inline(self, element) -> tuple:
         XLINK_NS = 'http://www.w3.org/1999/xlink'
- 
+        tp = self.tag_profile
+
         FB2_TAG_TO_HTML = {
             f'{{{self.FB2_NS}}}emphasis': 'i',
             f'{{{self.FB2_NS}}}strong': 'b',
@@ -3957,14 +4180,14 @@ class FB2Processor(FileProcessor):
             f'{{{self.FB2_NS}}}code': 'code',
             f'{{{self.FB2_NS}}}style': 'span',
         }
- 
+
         inline_formatting_map = {}
         counter = 0
         replacements = []
- 
+
         for child in element:
             local = child.tag.split('}')[-1] if '}' in child.tag else child.tag
- 
+
             if child.tag in FB2_TAG_TO_HTML:
                 html_tag = FB2_TAG_TO_HTML[child.tag]
                 attrs = {}
@@ -3983,10 +4206,10 @@ class FB2Processor(FileProcessor):
                     attrs['data-type'] = link_type
             else:
                 continue
- 
+
             elem_id = counter
-            opening = '<p_{:02d}>'.format(elem_id)
-            closing = '</p_{:02d}>'.format(elem_id)
+            opening = tp.inline_open_placeholder(elem_id)
+            closing = tp.inline_close_placeholder(elem_id)
             prev = child.getprevious()
             preceding = (element.text or '') if prev is None else (prev.tail or '')
             inline_formatting_map[elem_id] = {
@@ -3999,12 +4222,12 @@ class FB2Processor(FileProcessor):
             }
             replacements.append((child, opening, closing))
             counter += 1
- 
+
         if not replacements:
             return ''.join(element.itertext()).strip(), {}
- 
+
         replace_map = {id(e): (op, cl) for e, op, cl in replacements}
- 
+
         def serialize(node):
             parts = []
             nid = id(node)
@@ -4026,7 +4249,7 @@ class FB2Processor(FileProcessor):
                     if child.tail:
                         parts.append(child.tail)
             return ''.join(parts)
- 
+
         clean_text = serialize(element).strip()
         return clean_text, inline_formatting_map
  
@@ -4040,7 +4263,7 @@ class FB2Processor(FileProcessor):
             paragraphs = []
             fragment_id = 0
             use_inline = self.app_settings.get('use_inline_formatting', True)
-            placeholder_pattern = '<p_{:02d}>'
+            placeholder_pattern = f'<{self.tag_profile.reserve_prefix}{{:02d}}>'
 
             with open(path, 'rb') as f:
                 content = f.read()
@@ -4439,6 +4662,7 @@ class FB2Processor(FileProcessor):
 class DOCXProcessor(FileProcessor):
     def __init__(self, app_settings: dict):
         self.app_settings = app_settings
+        self.tag_profile = TagProfile.from_settings(app_settings)
         self.original_docx_path = None
         self.image_items = []
 
@@ -4494,8 +4718,23 @@ class DOCXProcessor(FileProcessor):
         if not any(r.bold or r.italic or r.underline for r in runs):
             return para_obj.text, {}
 
+        tp = self.tag_profile
         inline_formatting_map = {}
         counter = 0
+
+        def _wrap(tag_name, inner):
+            nonlocal counter
+            eid = counter
+            op = tp.inline_open_placeholder(eid)
+            cl = tp.inline_close_placeholder(eid)
+            inline_formatting_map[eid] = {
+                'tag': tag_name, 'attributes': {},
+                'opening_placeholder': op, 'closing_placeholder': cl,
+                'has_leading_space': False, 'has_trailing_space': False,
+            }
+            counter += 1
+            return op + inner + cl
+
         parts = []
         i = 0
 
@@ -4528,38 +4767,11 @@ class DOCXProcessor(FileProcessor):
 
             inner = seg_text
             if is_underline:
-                eid = counter
-                op = '<p_{:02d}>'.format(eid)
-                cl = '</p_{:02d}>'.format(eid)
-                inline_formatting_map[eid] = {
-                    'tag': 'u', 'attributes': {},
-                    'opening_placeholder': op, 'closing_placeholder': cl,
-                    'has_leading_space': False, 'has_trailing_space': False,
-                }
-                inner = op + inner + cl
-                counter += 1
+                inner = _wrap('u', inner)
             if is_italic:
-                eid = counter
-                op = '<p_{:02d}>'.format(eid)
-                cl = '</p_{:02d}>'.format(eid)
-                inline_formatting_map[eid] = {
-                    'tag': 'i', 'attributes': {},
-                    'opening_placeholder': op, 'closing_placeholder': cl,
-                    'has_leading_space': False, 'has_trailing_space': False,
-                }
-                inner = op + inner + cl
-                counter += 1
+                inner = _wrap('i', inner)
             if is_bold:
-                eid = counter
-                op = '<p_{:02d}>'.format(eid)
-                cl = '</p_{:02d}>'.format(eid)
-                inline_formatting_map[eid] = {
-                    'tag': 'b', 'attributes': {},
-                    'opening_placeholder': op, 'closing_placeholder': cl,
-                    'has_leading_space': False, 'has_trailing_space': False,
-                }
-                inner = op + inner + cl
-                counter += 1
+                inner = _wrap('b', inner)
 
             parts.append(inner)
             i = j
@@ -4579,7 +4791,7 @@ class DOCXProcessor(FileProcessor):
             chapter_index = 0
             para_number = 0
             use_inline = self.app_settings.get('use_inline_formatting', True)
-            placeholder_pattern = '<p_{:02d}>'
+            placeholder_pattern = f'<{self.tag_profile.reserve_prefix}{{:02d}}>'
 
             media_type_map = {
                 '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -4719,7 +4931,23 @@ def _extract_text_align(kindle_style: str) -> str:
                 return val.strip()
     return ''
 
-def _resolve_text(para: dict, keep_html: bool = False) -> str:
+def _any_inline_re(tp: TagProfile) -> re.Pattern:
+    return re.compile(rf'</?{re.escape(tp.inline_prefix)}\d{{2}}>')
+
+
+def _any_reserve_re(tp: TagProfile) -> re.Pattern:
+    return re.compile(rf'</?{re.escape(tp.reserve_prefix)}\d{{2}}>')
+
+def _resolve_text(para: dict, keep_html: bool = False, tag_profile: Optional[TagProfile] = None) -> str:
+    tp = tag_profile or TagProfile()
+    inline_any = _any_inline_re(tp)
+    reserve_any = _any_reserve_re(tp)
+    reserve_open = tp.reserve_open_re()
+    reserve_close = tp.reserve_close_re()
+    nt_re = tp.non_trans_open_re()
+    reserve_split = re.compile(rf'(<{re.escape(tp.reserve_prefix)}\d{{2}}>)')
+    inline_split = re.compile(f'({inline_any.pattern})')
+
     def _apply_auto_wrap(result_text: str) -> str:
         if not keep_html or not result_text:
             return result_text
@@ -4761,12 +4989,12 @@ def _resolve_text(para: dict, keep_html: bool = False) -> str:
         else para.get('original_text', '')
     ) or ''
 
-    text = re.sub(r'<nt_\d{2}/>', '', text)
+    text = nt_re.sub('', text)
 
     reserve_elements = para.get('reserve_elements') or []
 
     inline_map = para.get('inline_formatting_map')
-    if inline_map and re.search(r'</?p_\d{2}>', text):
+    if inline_map and inline_any.search(text):
         if keep_html:
             tag_lookup = {}
             for elem_id, info in inline_map.items():
@@ -4782,13 +5010,13 @@ def _resolve_text(para: dict, keep_html: bool = False) -> str:
                 tag_lookup[info['closing_placeholder']] = f'</{tag}>'
 
             def _expand_reserve(seg_text):
-                seg_text = re.sub(r'</id_\d{2}>', '', seg_text)
+                seg_text = reserve_close.sub('', seg_text)
                 if not reserve_elements:
-                    return html_module.escape(re.sub(r'<id_\d{2}>', '', seg_text))
-                pieces = re.split(r'(<id_\d{2}>)', seg_text)
+                    return html_module.escape(reserve_open.sub('', seg_text))
+                pieces = reserve_split.split(seg_text)
                 out = []
                 for piece in pieces:
-                    m = re.match(r'<id_(\d{2})>', piece)
+                    m = reserve_open.fullmatch(piece)
                     if m:
                         idx = int(m.group(1))
                         if idx < len(reserve_elements):
@@ -4802,32 +5030,32 @@ def _resolve_text(para: dict, keep_html: bool = False) -> str:
                         out.append(html_module.escape(piece))
                 return ''.join(out)
 
-            parts = re.split(r'(</?p_\d{2}>)', text)
+            parts = inline_split.split(text)
             result = []
             for part in parts:
                 if part in tag_lookup:
                     result.append(tag_lookup[part])
-                elif re.match(r'</?p_\d{2}>', part):
+                elif inline_any.fullmatch(part):
                     pass
                 else:
                     result.append(_expand_reserve(part))
             return _apply_auto_wrap(''.join(result).strip())
 
-        text = re.sub(r'</?p_\d{2}>', '', text)
+        text = inline_any.sub('', text)
         for idx in range(len(reserve_elements)):
-            text = text.replace('<id_{:02d}>'.format(idx), '')
-        text = re.sub(r'</?id_\d{2}>', '', text)
+            text = text.replace(tp.reserve_placeholder(idx), '')
+        text = reserve_any.sub('', text)
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
 
     if not reserve_elements:
-        text = re.sub(r'</?id_\d{2}>', '', text)
-        text = re.sub(r'</?p_\d{2}>', '', text)
+        text = reserve_any.sub('', text)
+        text = inline_any.sub('', text)
         result = text.strip()
         return _apply_auto_wrap(result) if keep_html else result
 
     for idx, element_html in enumerate(reserve_elements):
-        placeholder = '<id_{:02d}>'.format(idx)
+        placeholder = tp.reserve_placeholder(idx)
         if placeholder not in text:
             continue
         if keep_html:
@@ -4841,8 +5069,8 @@ def _resolve_text(para: dict, keep_html: bool = False) -> str:
         else:
             text = text.replace(placeholder, '')
 
-    text = re.sub(r'</?id_\d{2}>', '', text)
-    text = re.sub(r'</?p_\d{2}>', '', text)
+    text = reserve_any.sub('', text)
+    text = inline_any.sub('', text)
     text = re.sub(r'  +', ' ', text)
     result = text.strip()
     return _apply_auto_wrap(result) if keep_html else result
@@ -4854,7 +5082,8 @@ def _int_color_to_css(color_int: int) -> str:
     b = color_int & 0xFF
     return f"#{r:02x}{g:02x}{b:02x}"
 
-def _get_raw_text_for_inline(para: dict) -> str:
+def _get_raw_text_for_inline(para: dict, tag_profile: Optional[TagProfile] = None) -> str:
+    tp = tag_profile or TagProfile()
     text = (
         para.get('translated_text') if para.get('is_translated')
         else para.get('original_text', '')
@@ -4862,35 +5091,39 @@ def _get_raw_text_for_inline(para: dict) -> str:
 
     reserve_elements = para.get('reserve_elements')
     if reserve_elements:
-        placeholder_pattern = para.get('placeholder_pattern', '<id_{:02d}>')
         for idx in range(len(reserve_elements)):
-            text = text.replace(placeholder_pattern.format(idx), '')
+            text = text.replace(tp.reserve_placeholder(idx), '')
 
-    text = re.sub(r'</?id_\d{2}>', '', text)
-    text = re.sub(r'<nt_\d{2}/>', '', text)
+    text = _any_reserve_re(tp).sub('', text)
+    text = tp.non_trans_open_re().sub('', text)
     text = re.sub(r'  +', ' ', text)
     return text.strip()
 
 
-def _build_inline_segments(text: str, inline_map: dict):
+def _build_inline_segments(text: str, inline_map: dict, tag_profile: Optional[TagProfile] = None):
+    tp = tag_profile or TagProfile()
+    token_re = re.compile(rf'<(/?{re.escape(tp.inline_prefix)}(\d{{2}}))>')
     segments = []
     stack = []
     pos = 0
 
-    for m in re.finditer(r'<(/?p_(\d{2}))>', text):
+    def _flush(seg):
+        if not seg:
+            return
+        is_bold = any(inline_map.get(e, {}).get('tag') in ('b', 'strong') for e in stack)
+        is_italic = any(inline_map.get(e, {}).get('tag') in ('i', 'em') for e in stack)
+        is_underline = any(inline_map.get(e, {}).get('tag') == 'u' for e in stack)
+        link_href = next(
+            (inline_map[e].get('attributes', {}).get('href', '')
+             for e in reversed(stack)
+             if inline_map.get(e, {}).get('tag') == 'a'),
+            ''
+        )
+        segments.append((seg, is_bold, is_italic, is_underline, link_href))
+
+    for m in token_re.finditer(text):
         if m.start() > pos:
-            seg = text[pos:m.start()]
-            if seg:
-                is_bold = any(inline_map.get(e, {}).get('tag') in ('b', 'strong') for e in stack)
-                is_italic = any(inline_map.get(e, {}).get('tag') in ('i', 'em') for e in stack)
-                is_underline = any(inline_map.get(e, {}).get('tag') == 'u' for e in stack)
-                link_href = next(
-                    (inline_map[e].get('attributes', {}).get('href', '')
-                     for e in reversed(stack)
-                     if inline_map.get(e, {}).get('tag') == 'a'),
-                    ''
-                )
-                segments.append((seg, is_bold, is_italic, is_underline, link_href))
+            _flush(text[pos:m.start()])
 
         eid = int(m.group(2))
         if m.group(0).startswith('</'):
@@ -4901,34 +5134,27 @@ def _build_inline_segments(text: str, inline_map: dict):
         pos = m.end()
 
     if pos < len(text):
-        seg = text[pos:]
-        if seg:
-            is_bold = any(inline_map.get(e, {}).get('tag') in ('b', 'strong') for e in stack)
-            is_italic = any(inline_map.get(e, {}).get('tag') in ('i', 'em') for e in stack)
-            is_underline = any(inline_map.get(e, {}).get('tag') == 'u' for e in stack)
-            link_href = next(
-                (inline_map[e].get('attributes', {}).get('href', '')
-                 for e in reversed(stack)
-                 if inline_map.get(e, {}).get('tag') == 'a'),
-                ''
-            )
-            segments.append((seg, is_bold, is_italic, is_underline, link_href))
+        _flush(text[pos:])
 
     return segments
 
 
-def _fill_fb2_paragraph(p_elem, text: str, inline_map: dict, FB2_NS: str) -> None:
-    if not inline_map or not re.search(r'</?p_\d{2}>', text):
+def _fill_fb2_paragraph(p_elem, text: str, inline_map: dict, FB2_NS: str,
+                        tag_profile: Optional[TagProfile] = None) -> None:
+    tp = tag_profile or TagProfile()
+    if not inline_map or not _any_inline_re(tp).search(text):
         p_elem.text = text
         return
-    _fill_fb2_from_segments(p_elem, _build_inline_segments(text, inline_map), FB2_NS)
+    _fill_fb2_from_segments(p_elem, _build_inline_segments(text, inline_map, tp), FB2_NS)
 
 
-def _fill_docx_paragraph(p, text: str, inline_map: dict) -> None:
-    if not inline_map or not re.search(r'</?p_\d{2}>', text):
+def _fill_docx_paragraph(p, text: str, inline_map: dict,
+                         tag_profile: Optional[TagProfile] = None) -> None:
+    tp = tag_profile or TagProfile()
+    if not inline_map or not _any_inline_re(tp).search(text):
         p.add_run(text)
         return
-    _fill_docx_from_segments(p, _build_inline_segments(text, inline_map))
+    _fill_docx_from_segments(p, _build_inline_segments(text, inline_map, tp))
 
 def _parse_aligned_html_segments(aligned_html: str):
     BOLD_TAGS = {'b', 'strong'}
@@ -5098,7 +5324,8 @@ class EPUBWriter(QThread):
     finished = pyqtSignal(str, bool)
  
     def __init__(self, paragraphs, output_path, source_title="Translated",
-                 image_resources=None, source_format='epub', lang='en', css_class_styles=None):
+                 image_resources=None, source_format='epub', lang='en', css_class_styles=None,
+                 tag_profile: Optional[TagProfile] = None):
         super().__init__()
         self.paragraphs = paragraphs
         self.output_path = output_path
@@ -5107,6 +5334,7 @@ class EPUBWriter(QThread):
         self.source_format = source_format
         self.lang = lang
         self.css_class_styles = css_class_styles or {}
+        self.tag_profile = tag_profile or TagProfile()
  
     def run(self):
         dispatch = {
@@ -5130,7 +5358,7 @@ class EPUBWriter(QThread):
                 (p for p in self.paragraphs if p.get('element_type') == 'book_title'), None
             )
             if title_frag:
-                resolved_title = _resolve_text(title_frag, keep_html=False)
+                resolved_title = _resolve_text(title_frag, keep_html=False, tag_profile=self.tag_profile)
                 if resolved_title:
                     self.source_title = resolved_title
 
@@ -5236,7 +5464,7 @@ class EPUBWriter(QThread):
                     (p for p in paras if p.get('element_type') == 'heading'), None
                 )
                 if first_heading:
-                    raw = _resolve_text(first_heading, keep_html=False)
+                    raw = _resolve_text(first_heading, keep_html=False, tag_profile=self.tag_profile)
                     if raw:
                         chapter_title = raw[:60]
 
@@ -5248,7 +5476,7 @@ class EPUBWriter(QThread):
                         None
                     )
                     if first_text:
-                        raw = _resolve_text(first_text, keep_html=False)
+                        raw = _resolve_text(first_text, keep_html=False, tag_profile=self.tag_profile)
                         if raw:
                             words = raw.split()
                             chapter_title = ' '.join(words[:10])
@@ -5269,7 +5497,7 @@ class EPUBWriter(QThread):
                             body_parts.append(f'<img src="{file_name}" alt=""/>')
                         continue
 
-                    text = _resolve_text(para, keep_html=True)
+                    text = _resolve_text(para, keep_html=True, tag_profile=self.tag_profile)
                     if not text:
                         continue
                     has_html = bool(re.search(r'<[^>]+>', text))
@@ -5347,7 +5575,7 @@ class EPUBWriter(QThread):
                 (p for p in self.paragraphs if p.get('element_type') == 'book_title'), None
             )
             if title_frag:
-                resolved_title = _resolve_text(title_frag, keep_html=False)
+                resolved_title = _resolve_text(title_frag, keep_html=False, tag_profile=self.tag_profile)
                 if resolved_title:
                     self.source_title = resolved_title
 
@@ -5520,7 +5748,7 @@ class EPUBWriter(QThread):
                     (p for p in paras if p.get('element_type') == 'heading'), None
                 )
                 if first_heading:
-                    raw = _resolve_text(first_heading, keep_html=False)
+                    raw = _resolve_text(first_heading, keep_html=False, tag_profile=self.tag_profile)
                     if raw:
                         chapter_title = raw[:60]
 
@@ -5532,7 +5760,7 @@ class EPUBWriter(QThread):
                         None
                     )
                     if first_text:
-                        raw = _resolve_text(first_text, keep_html=False)
+                        raw = _resolve_text(first_text, keep_html=False, tag_profile=self.tag_profile)
                         if raw:
                             words = raw.split()
                             chapter_title = ' '.join(words[:10])
@@ -5557,7 +5785,7 @@ class EPUBWriter(QThread):
                         body_parts.append('<p class="empty-line">&#160;</p>')
                         continue
 
-                    text = _resolve_text(para, keep_html=True)
+                    text = _resolve_text(para, keep_html=True, tag_profile=self.tag_profile)
                     if not text:
                         if etype == 'table_row':
                             continue
@@ -5654,7 +5882,7 @@ class EPUBWriter(QThread):
                 (p for p in self.paragraphs if p.get('element_type') == 'book_title'), None
             )
             if title_frag:
-                resolved_title = _resolve_text(title_frag, keep_html=False)
+                resolved_title = _resolve_text(title_frag, keep_html=False, tag_profile=self.tag_profile)
                 if resolved_title:
                     self.source_title = resolved_title
 
@@ -5760,7 +5988,7 @@ class EPUBWriter(QThread):
                     (p for p in paras if p.get('element_type') == 'heading'), None
                 )
                 if first_heading:
-                    raw = _resolve_text(first_heading, keep_html=False)
+                    raw = _resolve_text(first_heading, keep_html=False, tag_profile=self.tag_profile)
                     if raw:
                         chapter_title = raw[:60]
 
@@ -5772,7 +6000,7 @@ class EPUBWriter(QThread):
                         None
                     )
                     if first_text:
-                        raw = _resolve_text(first_text, keep_html=False)
+                        raw = _resolve_text(first_text, keep_html=False, tag_profile=self.tag_profile)
                         if raw:
                             words = raw.split()
                             chapter_title = ' '.join(words[:10])
@@ -5793,7 +6021,7 @@ class EPUBWriter(QThread):
                             body_parts.append(f'<img src="{file_name}" alt=""/>')
                         continue
 
-                    text = _resolve_text(para, keep_html=True)
+                    text = _resolve_text(para, keep_html=True, tag_profile=self.tag_profile)
                     if not text:
                         continue
                     has_html = bool(re.search(r'<[^>]+>', text))
@@ -5870,7 +6098,7 @@ class EPUBWriter(QThread):
                 (p for p in self.paragraphs if p.get('element_type') == 'book_title'), None
             )
             if title_frag:
-                resolved_title = _resolve_text(title_frag, keep_html=False)
+                resolved_title = _resolve_text(title_frag, keep_html=False, tag_profile=self.tag_profile)
                 if resolved_title:
                     self.source_title = resolved_title
 
@@ -5992,7 +6220,7 @@ class EPUBWriter(QThread):
                     (p for p in paras if p.get('element_type') == 'heading'), None
                 )
                 if first_heading:
-                    raw = _resolve_text(first_heading, keep_html=False)
+                    raw = _resolve_text(first_heading, keep_html=False, tag_profile=self.tag_profile)
                     if raw:
                         chapter_title = raw[:60]
 
@@ -6004,7 +6232,7 @@ class EPUBWriter(QThread):
                         None
                     )
                     if first_text:
-                        raw = _resolve_text(first_text, keep_html=False)
+                        raw = _resolve_text(first_text, keep_html=False, tag_profile=self.tag_profile)
                         if raw:
                             words = raw.split()
                             chapter_title = ' '.join(words[:10])
@@ -6025,7 +6253,7 @@ class EPUBWriter(QThread):
                             body_parts.append(f'<img src="{file_name}" alt=""/>')
                         continue
 
-                    text = _resolve_text(para, keep_html=True)
+                    text = _resolve_text(para, keep_html=True, tag_profile=self.tag_profile)
                     if not text:
                         continue
                     has_html = bool(re.search(r'<[^>]+>', text))
@@ -6108,7 +6336,7 @@ class EPUBWriter(QThread):
                 (p for p in self.paragraphs if p.get('element_type') == 'book_title'), None
             )
             if title_frag:
-                resolved_title = _resolve_text(title_frag, keep_html=False)
+                resolved_title = _resolve_text(title_frag, keep_html=False, tag_profile=self.tag_profile)
                 if resolved_title:
                     self.source_title = resolved_title
 
@@ -6214,7 +6442,7 @@ class EPUBWriter(QThread):
                     (p for p in paras if p.get('element_type') == 'heading'), None
                 )
                 if first_heading:
-                    raw = _resolve_text(first_heading, keep_html=False)
+                    raw = _resolve_text(first_heading, keep_html=False, tag_profile=self.tag_profile)
                     if raw:
                         chapter_title = raw[:60]
 
@@ -6226,7 +6454,7 @@ class EPUBWriter(QThread):
                         None
                     )
                     if first_text:
-                        raw = _resolve_text(first_text, keep_html=False)
+                        raw = _resolve_text(first_text, keep_html=False, tag_profile=self.tag_profile)
                         if raw:
                             words = raw.split()
                             chapter_title = ' '.join(words[:10])
@@ -6247,7 +6475,7 @@ class EPUBWriter(QThread):
                             body_parts.append(f'<img src="{file_name}" alt=""/>')
                         continue
 
-                    text = _resolve_text(para, keep_html=True)
+                    text = _resolve_text(para, keep_html=True, tag_profile=self.tag_profile)
                     if not text:
                         continue
                     has_html = bool(re.search(r'<[^>]+>', text))
@@ -6323,7 +6551,7 @@ class EPUBWriter(QThread):
                 (p for p in self.paragraphs if p.get('element_type') == 'book_title'), None
             )
             if title_frag:
-                resolved_title = _resolve_text(title_frag, keep_html=False)
+                resolved_title = _resolve_text(title_frag, keep_html=False, tag_profile=self.tag_profile)
                 if resolved_title:
                     self.source_title = resolved_title
             book.set_title(self.source_title)
@@ -6467,7 +6695,7 @@ class EPUBWriter(QThread):
                     (p for p in paras if p.get('element_type') == 'heading'), None
                 )
                 if first_heading:
-                    raw = _resolve_text(first_heading, keep_html=False)
+                    raw = _resolve_text(first_heading, keep_html=False, tag_profile=self.tag_profile)
                     if raw:
                         chapter_title = raw[:60]
                 if not chapter_title:
@@ -6478,7 +6706,7 @@ class EPUBWriter(QThread):
                         None
                     )
                     if first_text:
-                        raw = _resolve_text(first_text, keep_html=False)
+                        raw = _resolve_text(first_text, keep_html=False, tag_profile=self.tag_profile)
                         if raw:
                             words = raw.split()
                             chapter_title = ' '.join(words[:10])
@@ -6501,7 +6729,7 @@ class EPUBWriter(QThread):
                                 body_parts.append(f'<p>{extra_anchors_html}</p>')
                             body_parts.append(f'<img src="{file_name}" alt=""/>')
                         continue
-                    text = _resolve_text(para, keep_html=True)
+                    text = _resolve_text(para, keep_html=True, tag_profile=self.tag_profile)
                     if not text:
                         if extra_anchors_html:
                             body_parts.append(f'<p>{extra_anchors_html}</p>')
@@ -6584,6 +6812,10 @@ class EPUBWriter(QThread):
         self.run_from_mobi()
  
     def _restore_inline_html(self, text: str, para: dict) -> str:
+        tp = self.tag_profile
+        ip = re.escape(tp.inline_prefix)
+        inline_any = _any_inline_re(tp)
+        reserve_open = tp.reserve_open_re()
         inline_map = para.get('inline_formatting_map', {})
         non_trans = para.get('non_translatable_placeholders', {})
         reserve_elements = para.get('reserve_elements', [])
@@ -6592,7 +6824,7 @@ class EPUBWriter(QThread):
         processing_mode = para.get('processing_mode', 'inline')
 
         for tag_id, info in non_trans.items():
-            nt_marker = f'<nt_{tag_id:02d}/>'
+            nt_marker = tp.non_trans_placeholder(int(tag_id))
             text = text.replace(nt_marker, info.get('full_match', info.get('content', '')))
 
         def _sub_inline(m):
@@ -6620,19 +6852,20 @@ class EPUBWriter(QThread):
             )
             return f'<{tag}{attr_str}>{inner}</{tag}>'
 
+        pair_pattern = rf'<{ip}(\d{{2}})>(.*?)</{ip}\1>'
         for _ in range(10):
-            new_text = re.sub(r'<p_(\d{2})>(.*?)</p_\1>', _sub_inline, text, flags=re.DOTALL)
+            new_text = re.sub(pair_pattern, _sub_inline, text, flags=re.DOTALL)
             if new_text == text:
                 break
             text = new_text
 
-        text = re.sub(r'</?p_\d{2}>', '', text)
+        text = inline_any.sub('', text)
 
         if processing_mode == 'legacy':
-            _res_split = re.compile(r'(<id_\d{2}>)')
+            _res_split = re.compile(rf'(<{re.escape(tp.reserve_prefix)}\d{{2}}>)')
             segments = _res_split.split(text)
             text = ''.join(
-                s if re.match(r'^<id_\d{2}>$', s) else html_module.escape(s)
+                s if reserve_open.fullmatch(s) else html_module.escape(s)
                 for s in segments
             )
 
@@ -6644,12 +6877,12 @@ class EPUBWriter(QThread):
                 return rv
             return ''
 
-        text = re.sub(r'<id_(\d{2})>', _sub_reserve, text)
+        text = reserve_open.sub(_sub_reserve, text)
 
         def _boundary_html(tags):
             parts = []
             for tag in tags:
-                bm = re.match(r'<id_(\d{2})>', tag)
+                bm = reserve_open.match(tag)
                 if bm:
                     idx = int(bm.group(1))
                     if idx < len(reserve_elements):
@@ -6674,7 +6907,7 @@ class EPUBWriter(QThread):
                 (p for p in self.paragraphs if p.get('element_type') == 'book_title'), None
             )
             if title_frag:
-                resolved_title = _resolve_text(title_frag, keep_html=False)
+                resolved_title = _resolve_text(title_frag, keep_html=False, tag_profile=self.tag_profile)
                 if resolved_title:
                     self.source_title = resolved_title
             book.set_title(self.source_title)
@@ -6786,13 +7019,13 @@ class EPUBWriter(QThread):
                 chapter_title = None
                 first_heading = next((p for p in paras if p.get('element_type') in _HEADING_TYPES), None)
                 if first_heading:
-                    raw = _resolve_text(first_heading, keep_html=False)
+                    raw = _resolve_text(first_heading, keep_html=False, tag_profile=self.tag_profile)
                     if raw:
                         chapter_title = raw[:60]
                 if not chapter_title:
                     first_text = next((p for p in paras if p.get('element_type') not in ('image',) and (p.get('translated_text') or p.get('original_text', ''))), None)
                     if first_text:
-                        raw = _resolve_text(first_text, keep_html=False)
+                        raw = _resolve_text(first_text, keep_html=False, tag_profile=self.tag_profile)
                         if raw:
                             words = raw.split()
                             chapter_title = ' '.join(words[:10])
@@ -6853,7 +7086,7 @@ class EPUBWriter(QThread):
                                 body_parts.append(f'<img src="{file_name}" alt=""/>')
                         continue
 
-                    text = _resolve_text(para, keep_html=True)
+                    text = _resolve_text(para, keep_html=True, tag_profile=self.tag_profile)
                     if not text:
                         continue
                     text = self._restore_inline_html(text, para)
@@ -6995,13 +7228,15 @@ class FB2Writer(QThread):
     finished = pyqtSignal(str, bool)
 
     def __init__(self, paragraphs, output_path, source_title="Translated",
-                 image_resources=None, source_format='epub'):
+                 image_resources=None, source_format='epub',
+                 tag_profile: Optional[TagProfile] = None):
         super().__init__()
         self.paragraphs = paragraphs
         self.output_path = output_path
         self.source_title = source_title
         self.image_resources = image_resources or []
         self.source_format = source_format
+        self.tag_profile = tag_profile or TagProfile()
 
     def run(self):
         self.run_from_fb2()
@@ -7076,7 +7311,7 @@ class FB2Writer(QThread):
                             _fill_fb2_from_segments(p_elem, segs, FB2_NS)
                             continue
 
-                    text = _get_raw_text_for_inline(para)
+                    text = _get_raw_text_for_inline(para, tag_profile=self.tag_profile)
                     if not text:
                         continue
 
@@ -7091,7 +7326,7 @@ class FB2Writer(QThread):
                     else:
                         p_elem = etree.SubElement(section, f'{{{FB2_NS}}}p')
 
-                    _fill_fb2_paragraph(p_elem, text, inline_map, FB2_NS)
+                    _fill_fb2_paragraph(p_elem, text, inline_map, FB2_NS, tag_profile=self.tag_profile)
 
             for res in self.image_resources:
                 binary_elem = etree.SubElement(root, f'{{{FB2_NS}}}binary')
@@ -7115,13 +7350,15 @@ class DOCXWriter(QThread):
     finished = pyqtSignal(str, bool)
 
     def __init__(self, paragraphs, output_path, source_title="Translated",
-                 image_resources=None, source_format='epub'):
+                 image_resources=None, source_format='epub',
+                 tag_profile: Optional[TagProfile] = None):
         super().__init__()
         self.paragraphs = paragraphs
         self.output_path = output_path
         self.source_title = source_title
         self.image_resources = image_resources or []
         self.source_format = source_format
+        self.tag_profile = tag_profile or TagProfile()
 
     def run(self):
         self.run_from_docx()
@@ -7172,7 +7409,7 @@ class DOCXWriter(QThread):
                         _fill_docx_from_segments(p, segs)
                         continue
 
-                text = _get_raw_text_for_inline(para)
+                text = _get_raw_text_for_inline(para, tag_profile=self.tag_profile)
                 if not text:
                     continue
 
@@ -7185,7 +7422,7 @@ class DOCXWriter(QThread):
                 else:
                     p = doc.add_paragraph()
 
-                _fill_docx_paragraph(p, text, inline_map)
+                _fill_docx_paragraph(p, text, inline_map, tag_profile=self.tag_profile)
 
             doc.save(self.output_path)
             logger.info(f"DOCXWriter: saved to {self.output_path}")
@@ -7203,6 +7440,8 @@ class FileProcessorFactory:
             return EPUBProcessor(app_settings)
         elif file_type == "srt":
             return SRTProcessor()
+        elif file_type == "ass":
+            return ASSProcessor()
         elif file_type == "txt":
             return TXTProcessor()
         elif file_type == "pdf":
@@ -7221,11 +7460,12 @@ class FileProcessorFactory:
     @staticmethod
     def create_writer(output_format: str, paragraphs, output_path: str,
                       source_title: str = "Translated", image_resources=None,
-                      source_format: str = 'epub', lang: str = 'en'):
+                      source_format: str = 'epub', lang: str = 'en',
+                      tag_profile: Optional[TagProfile] = None):
         if output_format == 'fb2':
-            return FB2Writer(paragraphs, output_path, source_title, image_resources, source_format)
+            return FB2Writer(paragraphs, output_path, source_title, image_resources, source_format, tag_profile=tag_profile)
         elif output_format == 'docx':
-            return DOCXWriter(paragraphs, output_path, source_title, image_resources, source_format)
+            return DOCXWriter(paragraphs, output_path, source_title, image_resources, source_format, tag_profile=tag_profile)
         else:
-            return EPUBWriter(paragraphs, output_path, source_title, image_resources, source_format, lang)
+            return EPUBWriter(paragraphs, output_path, source_title, image_resources, source_format, lang, tag_profile=tag_profile)
  
