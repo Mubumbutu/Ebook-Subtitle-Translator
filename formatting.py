@@ -2,6 +2,7 @@
 import logging
 import re
 from typing import Dict, List, Optional, Tuple
+from app_utils import TagProfile
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +85,23 @@ def count_double_quotes(text: str) -> int:
 def count_all_quotes(text: str) -> int:
     return sum(1 for ch in text if ch in DOUBLE_QUOTES_CHARS)
 
-def has_quote_at_start(text: str) -> bool:
+def _placeholder_alternation(tag_profile: Optional[TagProfile] = None) -> str:
+    tp = tag_profile or TagProfile()
+    return "|".join([
+        rf'</?{re.escape(tp.inline_prefix)}\d{{2}}>',
+        rf'</?{re.escape(tp.reserve_prefix)}\d{{2}}>',
+        rf'<{re.escape(tp.non_trans_prefix)}\d{{2}}/>',
+        rf'</?{re.escape(tp.paragraph_separator)}>',
+        rf'<{re.escape(tp.batch_separator)}>',
+    ])
+
+def has_quote_at_start(text: str, tag_profile: Optional[TagProfile] = None) -> bool:
     text = text.lstrip()
     if not text:
         return False
 
-    text_no_placeholders = re.sub(r'^(</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|\s)+', '', text)
+    alt = _placeholder_alternation(tag_profile)
+    text_no_placeholders = re.sub(rf'^(?:{alt}|\s)+', '', text)
 
     if not text_no_placeholders:
         return False
@@ -102,12 +114,13 @@ def has_quote_at_start(text: str) -> bool:
 
     return False
 
-def has_quote_at_end(text: str) -> bool:
+def has_quote_at_end(text: str, tag_profile: Optional[TagProfile] = None) -> bool:
     text = text.rstrip()
     if not text:
         return False
 
-    text_no_placeholders = re.sub(r'(\s|</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>)+$', '', text).rstrip()
+    alt = _placeholder_alternation(tag_profile)
+    text_no_placeholders = re.sub(rf'(?:\s|{alt})+$', '', text).rstrip()
 
     if not text_no_placeholders:
         return False
@@ -125,28 +138,30 @@ def has_quote_at_end(text: str) -> bool:
 def contains_dash(text: str) -> bool:
     return '-' in text or '–' in text or '—' in text
 
-def count_external_quotes(text: str) -> int:
+def count_external_quotes(text: str, tag_profile: Optional[TagProfile] = None) -> int:
     count = 0
+    alt = _placeholder_alternation(tag_profile)
 
     text_start = text.lstrip()
-    text_start_clean = re.sub(r'^(</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|\s)+', '', text_start)
+    text_start_clean = re.sub(rf'^(?:{alt}|\s)+', '', text_start)
 
     if text_start_clean and re.match(ALL_QUOTES, text_start_clean):
         count += 1
 
     text_end = text.rstrip()
-    text_end_clean = re.sub(r'(\s|</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>)+$', '', text_end).rstrip()
+    text_end_clean = re.sub(rf'(?:\s|{alt})+$', '', text_end).rstrip()
 
     if text_end_clean and re.match(ALL_QUOTES, text_end_clean[-1]):
         count += 1
 
     return count
 
-def add_quote_to_start(text: str, quote_char: str = '"') -> str:
+def add_quote_to_start(text: str, quote_char: str = '"', tag_profile: Optional[TagProfile] = None) -> str:
     stripped = text.lstrip()
     leading_ws = text[:len(text) - len(stripped)]
+    alt = _placeholder_alternation(tag_profile)
 
-    match = re.match(r'^(</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|\s)*', stripped)
+    match = re.match(rf'^(?:{alt}|\s)*', stripped)
     if match:
         placeholders = match.group(0)
         content = stripped[len(placeholders):]
@@ -155,11 +170,12 @@ def add_quote_to_start(text: str, quote_char: str = '"') -> str:
         return leading_ws + quote_char + stripped
 
 
-def add_quote_to_end(text: str, quote_char: str = '"') -> str:
+def add_quote_to_end(text: str, quote_char: str = '"', tag_profile: Optional[TagProfile] = None) -> str:
     stripped = text.rstrip()
     trailing_ws = text[len(stripped):]
+    alt = _placeholder_alternation(tag_profile)
 
-    match = re.search(r'(</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|\s)*$', stripped)
+    match = re.search(rf'(?:{alt}|\s)*$', stripped)
     if match:
         placeholders = match.group(0)
         content = stripped[:len(stripped) - len(placeholders)]
@@ -167,14 +183,15 @@ def add_quote_to_end(text: str, quote_char: str = '"') -> str:
     else:
         return stripped + quote_char + trailing_ws
 
-def remove_quote_from_start(text: str, force: bool = False) -> str:
+def remove_quote_from_start(text: str, force: bool = False, tag_profile: Optional[TagProfile] = None) -> str:
     stripped = text.lstrip()
     leading_ws = text[:len(text) - len(stripped)]
 
     if not stripped:
         return text
 
-    match = re.match(r'^(</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|\s)*', stripped)
+    alt = _placeholder_alternation(tag_profile)
+    match = re.match(rf'^(?:{alt}|\s)*', stripped)
     if match:
         placeholders = match.group(0)
         content = stripped[len(placeholders):]
@@ -191,14 +208,15 @@ def remove_quote_from_start(text: str, force: bool = False) -> str:
 
     return text
 
-def remove_quote_from_end(text: str, force: bool = False) -> str:
+def remove_quote_from_end(text: str, force: bool = False, tag_profile: Optional[TagProfile] = None) -> str:
     stripped = text.rstrip()
     trailing_ws = text[len(stripped):]
 
     if not stripped:
         return text
 
-    match = re.search(r'(</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|\s)*$', stripped)
+    alt = _placeholder_alternation(tag_profile)
+    match = re.search(rf'(?:{alt}|\s)*$', stripped)
     if match:
         placeholders = match.group(0)
         content = stripped[:len(stripped) - len(placeholders)]
@@ -343,9 +361,16 @@ class MismatchChecker:
         "position_shift_threshold": 0.15,
     }
 
-    def __init__(self, file_type: str, processing_mode: str = "inline", mismatch_settings: Dict = None):
+    def __init__(
+        self,
+        file_type: str,
+        processing_mode: str = "inline",
+        mismatch_settings: Dict = None,
+        tag_profile: Optional[TagProfile] = None
+    ):
         self.file_type = file_type
         self.processing_mode = processing_mode
+        self.tag_profile = tag_profile or TagProfile()
 
         if mismatch_settings:
             checks = self.DEFAULT_CHECKS.copy()
@@ -372,9 +397,10 @@ class MismatchChecker:
             return self._check_mismatch_inline(para)
 
     def check_batch_markers(self, response: str, expected_count: int) -> Tuple[bool, str]:
-        actual_count = response.count('<z>')
+        sep = f"<{self.tag_profile.batch_separator}>"
+        actual_count = len(self.tag_profile.batch_sep_re().findall(response))
         if actual_count != expected_count:
-            return True, f"Expected {expected_count} <z> markers, found {actual_count}"
+            return True, f"Expected {expected_count} {sep} markers, found {actual_count}"
         return False, ""
 
     def _dynamic_length_mismatch(self, a: str, b: str) -> bool:
@@ -435,14 +461,28 @@ class MismatchChecker:
 
     def _detect_raw_html_and_drift(self, orig: str, trans_raw: str, trans: str) -> Dict:
         flags = {}
+        tp = self.tag_profile
 
         unexpected = re.findall(r'</?([a-zA-Z][^>\s]*)[^>]*>', trans_raw)
 
+        placeholder_name_re = re.compile(
+            rf'^/?(?:{re.escape(tp.inline_prefix)}|{re.escape(tp.reserve_prefix)}|{re.escape(tp.non_trans_prefix)})\d{{2}}$',
+            re.IGNORECASE
+        )
+        allowed_names = {
+            'translated', 'translation',
+            tp.inline_prefix.rstrip('_').lower(),
+            tp.reserve_prefix.rstrip('_').lower(),
+            tp.non_trans_prefix.rstrip('_').lower(),
+            tp.paragraph_separator.lower(),
+            tp.batch_separator.lower(),
+        }
+
         def _is_allowed_tag(tag: str) -> bool:
             t = tag.lower().rstrip('/')
-            if t in {'p', 'id', 'nt', 'ps', 'translated', 'translation'}:
+            if t in allowed_names:
                 return True
-            if re.match(r'^/?(?:p|id|nt)_\d{2}$', t):
+            if placeholder_name_re.match(t):
                 return True
             return False
 
@@ -605,8 +645,9 @@ class MismatchChecker:
 
         reserve_ok, reserve_errors = self._check_reserve_elements_legacy(orig_raw, trans_raw)
 
-        orig = re.sub(r'<id_\d{2}>', '', orig_raw)
-        trans = re.sub(r'<id_\d{2}>', '', trans_raw)
+        reserve_open = self.tag_profile.reserve_open_re()
+        orig = reserve_open.sub('', orig_raw)
+        trans = reserve_open.sub('', trans_raw)
 
         if not trans.strip() or orig.strip() == trans.strip():
             mismatch_flags = {}
@@ -699,31 +740,33 @@ class MismatchChecker:
         return self._check_untranslated_with_threshold(orig, trans)
 
     def _check_reserve_elements_integrity(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
-        orig_reserves  = re.findall(r'<id_(\d{2})>', original)
-        trans_reserves = re.findall(r'<id_(\d{2})>', translated)
+        tp = self.tag_profile
+        open_re = tp.reserve_open_re()
+        orig_reserves  = open_re.findall(original)
+        trans_reserves = open_re.findall(translated)
 
         error_details: Dict = {}
 
         if sorted(orig_reserves) != sorted(trans_reserves):
-            missing = [f"<id_{t}>" for t in orig_reserves
+            missing = [tp.reserve_placeholder(int(t)) for t in orig_reserves
                        if orig_reserves.count(t) > trans_reserves.count(t)]
-            extra   = [f"<id_{t}>" for t in trans_reserves
+            extra   = [tp.reserve_placeholder(int(t)) for t in trans_reserves
                        if trans_reserves.count(t) > orig_reserves.count(t)]
             if missing:
                 error_details['missing'] = list(set(missing))
             if extra:
                 error_details['extra'] = list(set(extra))
 
-        spurious_closing = re.findall(r'</id_(\d{2})>', translated)
+        spurious_closing = tp.reserve_close_re().findall(translated)
         if spurious_closing:
             error_details['spurious_closing'] = list(
-                set(f"</id_{t}>" for t in spurious_closing)
+                set(f"</{tp.reserve_prefix}{t}>" for t in spurious_closing)
             )
 
         threshold = self.thresholds.get("position_shift_threshold", 0.15)
 
-        orig_positions  = self._get_self_closing_tag_positions(original,    r'<id_(\d{2})>')
-        trans_positions = self._get_self_closing_tag_positions(translated,  r'<id_(\d{2})>')
+        orig_positions  = self._get_self_closing_tag_positions(original,   open_re)
+        trans_positions = self._get_self_closing_tag_positions(translated, open_re)
 
         common_ids = set(orig_positions.keys()) & set(trans_positions.keys())
         positioning_errors = []
@@ -739,7 +782,7 @@ class MismatchChecker:
                     'orig_rel_pos':  round(orig_pos,  2),
                     'trans_rel_pos': round(trans_pos, 2),
                     'description':  (
-                        f"<id_{tag_id}> is at ~{orig_pos:.0%} in original "
+                        f"{tp.reserve_placeholder(int(tag_id))} is at ~{orig_pos:.0%} in original "
                         f"but at ~{trans_pos:.0%} in translation"
                     ),
                 })
@@ -755,24 +798,27 @@ class MismatchChecker:
         return self._check_reserve_elements_integrity(original, translated)
 
     def _check_inline_formatting_integrity(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
-        orig_opens  = re.findall(r'<p_(\d{2})>', original)
-        orig_closes = re.findall(r'</p_(\d{2})>', original)
-        trans_opens  = re.findall(r'<p_(\d{2})>', translated)
-        trans_closes = re.findall(r'</p_(\d{2})>', translated)
+        tp = self.tag_profile
+        open_re = tp.inline_open_re()
+        close_re = tp.inline_close_re()
+        orig_opens  = open_re.findall(original)
+        orig_closes = close_re.findall(original)
+        trans_opens  = open_re.findall(translated)
+        trans_closes = close_re.findall(translated)
 
         error_details = {}
 
         if sorted(orig_opens) != sorted(trans_opens):
-            missing_opens = [f"<p_{t}>" for t in orig_opens if orig_opens.count(t) > trans_opens.count(t)]
-            extra_opens   = [f"<p_{t}>" for t in trans_opens if trans_opens.count(t) > orig_opens.count(t)]
+            missing_opens = [tp.inline_open_placeholder(int(t)) for t in orig_opens if orig_opens.count(t) > trans_opens.count(t)]
+            extra_opens   = [tp.inline_open_placeholder(int(t)) for t in trans_opens if trans_opens.count(t) > orig_opens.count(t)]
             if missing_opens or extra_opens:
                 error_details['opening_tags'] = {}
                 if missing_opens: error_details['opening_tags']['missing'] = list(set(missing_opens))
                 if extra_opens:   error_details['opening_tags']['extra']   = list(set(extra_opens))
 
         if sorted(orig_closes) != sorted(trans_closes):
-            missing_closes = [f"</p_{t}>" for t in orig_closes if orig_closes.count(t) > trans_closes.count(t)]
-            extra_closes   = [f"</p_{t}>" for t in trans_closes if trans_closes.count(t) > orig_closes.count(t)]
+            missing_closes = [tp.inline_close_placeholder(int(t)) for t in orig_closes if orig_closes.count(t) > trans_closes.count(t)]
+            extra_closes   = [tp.inline_close_placeholder(int(t)) for t in trans_closes if trans_closes.count(t) > orig_closes.count(t)]
             if missing_closes or extra_closes:
                 error_details['closing_tags'] = {}
                 if missing_closes: error_details['closing_tags']['missing'] = list(set(missing_closes))
@@ -796,6 +842,7 @@ class MismatchChecker:
 
     def _check_inline_formatting_position(self, original: str, translated: str) -> List[Dict]:
         errors = []
+        ip = self.tag_profile.inline_prefix
         orig_structure  = self._parse_inline_structure(original)
         trans_structure = self._parse_inline_structure(translated)
         all_tag_ids = set(orig_structure.keys()) | set(trans_structure.keys())
@@ -819,7 +866,7 @@ class MismatchChecker:
                     'orig_content':   orig_info.get('content', ''),
                     'trans_content':  trans_info.get('content', ''),
                     'description': (
-                        f"Tag <p_{tag_id}> covers {orig_coverage:.0%} of text in original "
+                        f"Tag <{ip}{tag_id}> covers {orig_coverage:.0%} of text in original "
                         f"but {trans_coverage:.0%} in translation"
                     ),
                 })
@@ -835,7 +882,7 @@ class MismatchChecker:
                     'orig_content':     orig_info.get('content', ''),
                     'trans_content':    trans_info.get('content', ''),
                     'description': (
-                        f"Tag <p_{tag_id}> starts at {orig_rel_start:.0%} in original "
+                        f"Tag <{ip}{tag_id}> starts at {orig_rel_start:.0%} in original "
                         f"but at {trans_rel_start:.0%} in translation"
                     ),
                 })
@@ -851,7 +898,7 @@ class MismatchChecker:
                     'orig_content':  orig_info.get('content', ''),
                     'trans_content': trans_info.get('content', ''),
                     'description': (
-                        f"Tag <p_{tag_id}> has different nesting: "
+                        f"Tag <{ip}{tag_id}> has different nesting: "
                         f"parent {orig_parent} in original, {trans_parent} in translation"
                     ),
                 })
@@ -859,28 +906,35 @@ class MismatchChecker:
         return errors
 
     def _parse_inline_structure(self, text: str) -> Dict:
-        clean_text = re.sub(r'</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|</?ps>', '', text)
+        tp = self.tag_profile
+        placeholder_re = tp.all_placeholders_re()
+        open_re = tp.inline_open_re()
+        close_re = tp.inline_close_re()
+
+        clean_text = placeholder_re.sub('', text)
         total_length = len(clean_text)
         if total_length == 0:
             return {}
+
+        token_re = re.compile(f'{placeholder_re.pattern}|[^<]+|<[^>]*>')
 
         structure = {}
         stack = []
         current_pos = 0
         content_accumulator: Dict[str, str] = {}
 
-        pattern = r'(<p_(\d{2})>|</p_(\d{2})>|<id_\d{2}>|<nt_\d{2}/>|</?ps>|[^<]+|<[^>]*>)'
-
-        for match in re.finditer(pattern, text):
+        for match in token_re.finditer(text):
             token = match.group(0)
+            open_match = open_re.fullmatch(token)
+            close_match = close_re.fullmatch(token)
 
-            if token.startswith('<p_') and not token.startswith('</p_'):
-                tag_id = re.search(r'<p_(\d{2})>', token).group(1)
+            if open_match:
+                tag_id = open_match.group(1)
                 stack.append((tag_id, current_pos))
                 content_accumulator[tag_id] = ''
 
-            elif token.startswith('</p_'):
-                tag_id = re.search(r'</p_(\d{2})>', token).group(1)
+            elif close_match:
+                tag_id = close_match.group(1)
                 for i in range(len(stack) - 1, -1, -1):
                     if stack[i][0] == tag_id:
                         opening_tag_id, start_pos = stack.pop(i)
@@ -903,10 +957,7 @@ class MismatchChecker:
                                 structure[parent]['children'].append(tag_id)
                         break
 
-            elif (token.startswith('<id_')
-                  or token.startswith('<nt_')
-                  or token == '<ps>'
-                  or token == '</ps>'):
+            elif placeholder_re.fullmatch(token):
                 pass
 
             else:
@@ -917,13 +968,11 @@ class MismatchChecker:
 
         return structure
 
-    def _get_self_closing_tag_positions(self, text: str, tag_regex: str) -> Dict[str, float]:
-        ALL_PLACEHOLDER = re.compile(
-            r'</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|</?ps>'
-        )
-        TARGET_TAG = re.compile(tag_regex)
+    def _get_self_closing_tag_positions(self, text: str, tag_regex) -> Dict[str, float]:
+        placeholder_re = self.tag_profile.all_placeholders_re()
+        target_re = re.compile(tag_regex)
 
-        clean_text = ALL_PLACEHOLDER.sub('', text)
+        clean_text = placeholder_re.sub('', text)
         total_len = len(clean_text)
         if total_len == 0:
             return {}
@@ -931,19 +980,17 @@ class MismatchChecker:
         positions: Dict[str, float] = {}
         clean_pos = 0
 
-        token_re = re.compile(
-            r'</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|</?ps>|[^<]+|<[^>]*>'
-        )
+        token_re = re.compile(f'{placeholder_re.pattern}|[^<]+|<[^>]*>')
 
         for m in token_re.finditer(text):
             token = m.group(0)
 
-            target_match = TARGET_TAG.match(token)
+            target_match = target_re.match(token)
             if target_match:
                 tag_id = target_match.group(1)
                 if tag_id not in positions:
                     positions[tag_id] = clean_pos / total_len
-            elif ALL_PLACEHOLDER.match(token):
+            elif placeholder_re.match(token):
                 pass
             else:
                 clean_pos += len(token)
@@ -962,23 +1009,20 @@ class MismatchChecker:
         return working_text
 
     def _remove_all_placeholders(self, text: str) -> str:
-        text = re.sub(r'<id_\d{2}>', '', text)
-        text = re.sub(r'</id_\d{2}>', '', text)
-        text = re.sub(r'</?p_\d{2}>', '', text)
-        text = re.sub(r'<nt_\d{2}/>', '', text)
-        text = re.sub(r'</?ps>', '', text)
-        return text
+        return self.tag_profile.all_placeholders_re().sub('', text)
 
     def _check_nt_markers_integrity(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
-        orig_nt  = re.findall(r'<nt_(\d{2})/>', original)
-        trans_nt = re.findall(r'<nt_(\d{2})/>', translated)
+        tp = self.tag_profile
+        nt_re = tp.non_trans_open_re()
+        orig_nt  = nt_re.findall(original)
+        trans_nt = nt_re.findall(translated)
 
         error_details: Dict = {}
 
         if sorted(orig_nt) != sorted(trans_nt):
-            missing = [f"<nt_{t}/>" for t in orig_nt
+            missing = [tp.non_trans_placeholder(int(t)) for t in orig_nt
                        if orig_nt.count(t) > trans_nt.count(t)]
-            extra   = [f"<nt_{t}/>" for t in trans_nt
+            extra   = [tp.non_trans_placeholder(int(t)) for t in trans_nt
                        if trans_nt.count(t) > orig_nt.count(t)]
             if missing:
                 error_details['missing'] = list(set(missing))
@@ -987,8 +1031,8 @@ class MismatchChecker:
 
         threshold = self.thresholds.get("position_shift_threshold", 0.15)
 
-        orig_positions  = self._get_self_closing_tag_positions(original,   r'<nt_(\d{2})/>')
-        trans_positions = self._get_self_closing_tag_positions(translated, r'<nt_(\d{2})/>')
+        orig_positions  = self._get_self_closing_tag_positions(original,   nt_re)
+        trans_positions = self._get_self_closing_tag_positions(translated, nt_re)
 
         common_ids = set(orig_positions.keys()) & set(trans_positions.keys())
         positioning_errors = []
@@ -1004,7 +1048,7 @@ class MismatchChecker:
                     'orig_rel_pos':   round(orig_pos,  2),
                     'trans_rel_pos':  round(trans_pos, 2),
                     'description':   (
-                        f"<nt_{tag_id}/> is at ~{orig_pos:.0%} in original "
+                        f"{tp.non_trans_placeholder(int(tag_id))} is at ~{orig_pos:.0%} in original "
                         f"but at ~{trans_pos:.0%} in translation"
                     ),
                 })
@@ -1017,8 +1061,9 @@ class MismatchChecker:
         return True, None
 
     def _check_ps_markers_integrity(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
-        orig_ps = re.findall(r'<ps>', original)
-        trans_ps = re.findall(r'<ps>', translated)
+        ps_re = self.tag_profile.paragraph_sep_re()
+        orig_ps = ps_re.findall(original)
+        trans_ps = ps_re.findall(translated)
 
         if not orig_ps and not trans_ps:
             return True, None
@@ -1043,12 +1088,20 @@ class MismatchChecker:
         return False, error_details
 
 class FormattingSynchronizer:
-    def __init__(self, file_type: str, quote_style: str = 'neutral'):
+    def __init__(
+        self,
+        file_type: str,
+        quote_style: str = 'neutral',
+        response_wrapper_tag: str = 'translated',
+        tag_profile: Optional[TagProfile] = None
+    ):
         self.file_type = file_type
         self.quote_style = quote_style
         pair = QUOTE_STYLE_OPTIONS.get(quote_style, ('"', '"'))
         self._quote_open: str = pair[0]
         self._quote_close: str = pair[1]
+        self.response_wrapper_tag = (response_wrapper_tag or 'translated').strip() or 'translated'
+        self.tag_profile = tag_profile or TagProfile()
 
     def sync_formatting(
         self,
@@ -1092,7 +1145,7 @@ class FormattingSynchronizer:
 
         result = self.normalize_quotes(result)
 
-        if self.file_type == "srt":
+        if self.file_type in ("srt", "ass"):
             result = self.sync_formatting_srt(original, result)
         else:
             result = self.sync_formatting_epub(original, result)
@@ -1104,39 +1157,40 @@ class FormattingSynchronizer:
         leading_ws  = text[:len(text) - len(text.lstrip())]
         trailing_ws = text[len(text.rstrip()):]
 
-        has_translation_open  = re.match(r'^<translation>', text_stripped, re.IGNORECASE)
-        has_translation_close = re.search(r'</translation>$', text_stripped, re.IGNORECASE)
+        custom_tag = self.response_wrapper_tag
+        custom_variants = {
+            custom_tag,
+            custom_tag.upper(),
+            custom_tag.lower(),
+            custom_tag.capitalize(),
+        }
+        standard_variants = {'translated', 'translation', 'TRANSLATED', 'TRANSLATION', 'Translated', 'Translation'}
+        all_variants = custom_variants | standard_variants
+
+        OPENING_TAGS = [f'<{v}>' for v in all_variants]
+        CLOSING_TAGS = [f'</{v}>' for v in all_variants]
+
+        has_translation_open  = any(text_stripped.startswith(t) for t in OPENING_TAGS)
+        has_translation_close = any(text_stripped.endswith(t) for t in CLOSING_TAGS)
 
         if has_translation_open and has_translation_close:
-            text_without_tags = re.sub(
-                r'^<translation>\s*|\s*</translation>$',
-                '',
-                text_stripped,
-                flags=re.IGNORECASE
-            ).strip()
-            return leading_ws + text_without_tags + trailing_ws
+            for ot in OPENING_TAGS:
+                if not text_stripped.startswith(ot):
+                    continue
+                for ct in CLOSING_TAGS:
+                    if not text_stripped.endswith(ct):
+                        continue
+                    inner = text_stripped[len(ot):len(text_stripped) - len(ct)].strip()
+                    return leading_ws + inner + trailing_ws
 
         if '</text_to_translate>' in text_stripped:
             text_stripped = text_stripped.replace('</text_to_translate>', '')
             logger.debug("Removed rogue </text_to_translate> tag")
 
-        if re.search(r'</id_\d{2}>', text_stripped):
-            text_stripped = re.sub(r'</id_\d{2}>', '', text_stripped).strip()
-            logger.debug("Removed spurious </id_XX> closing tag(s)")
-
-        OPENING_TAGS = [
-            '<translated>',
-            '<TRANSLATED>',
-            '<translation>',
-            '<TRANSLATION>',
-        ]
-
-        CLOSING_TAGS = [
-            '</translated>',
-            '</TRANSLATED>',
-            '</translation>',
-            '</TRANSLATION>',
-        ]
+        reserve_close = self.tag_profile.reserve_close_re()
+        if reserve_close.search(text_stripped):
+            text_stripped = reserve_close.sub('', text_stripped).strip()
+            logger.debug("Removed spurious reserve closing tag(s)")
 
         has_opening_tag    = False
         opening_tag_length = 0
@@ -1168,9 +1222,10 @@ class FormattingSynchronizer:
             text_without_closing = text_stripped[:-closing_tag_length].strip()
             return leading_ws + text_without_closing + trailing_ws
 
-        cleaned = re.sub(r'</?(?:translated|translation)>', '', text_stripped, flags=re.IGNORECASE)
+        variants_alt = '|'.join(re.escape(v) for v in all_variants)
+        cleaned = re.sub(rf'</?(?:{variants_alt})>', '', text_stripped, flags=re.IGNORECASE)
         if cleaned != text_stripped:
-            logger.debug("Removed stray translated/translation tag(s) from within text")
+            logger.debug("Removed stray wrapper tag(s) from within text")
             text_stripped = cleaned.strip()
 
         return leading_ws + text_stripped + trailing_ws
@@ -1751,14 +1806,15 @@ class FormattingSynchronizer:
     def sync_quotes(self, original: str, translated: str) -> str:
         q_open = self._quote_open
         q_close = self._quote_close
+        tp = self.tag_profile
 
         def _count_active_quotes(text: str) -> int:
             active_chars = {'"', q_open, q_close}
             return sum(1 for ch in text if ch in active_chars)
 
         def process_single_line(orig_line, trans_line):
-            orig_has_start = has_quote_at_start(orig_line)
-            orig_has_end = has_quote_at_end(orig_line)
+            orig_has_start = has_quote_at_start(orig_line, tag_profile=tp)
+            orig_has_end = has_quote_at_end(orig_line, tag_profile=tp)
 
             trans_stripped = trans_line.lstrip()
             trans_has_quote_start = bool(trans_stripped and re.match(ALL_QUOTES, trans_stripped))
@@ -1769,7 +1825,7 @@ class FormattingSynchronizer:
             ))
             trans_has_start = trans_has_quote_start or trans_has_dash_start
 
-            trans_has_end = has_quote_at_end(trans_line)
+            trans_has_end = has_quote_at_end(trans_line, tag_profile=tp)
 
             result = trans_line
 
@@ -1782,31 +1838,31 @@ class FormattingSynchronizer:
             need_end = orig_has_end and not trans_has_end
 
             if need_start and need_end:
-                result = add_quote_to_start(result, q_open)
-                result = add_quote_to_end(result, q_close)
+                result = add_quote_to_start(result, q_open, tag_profile=tp)
+                result = add_quote_to_end(result, q_close, tag_profile=tp)
                 trans_has_start = True
                 trans_has_end = True
             elif need_start:
                 if orig_has_start and trans_has_dash_start and not trans_has_quote_start:
                     pass
                 elif not is_even or orig_quote_parity_odd:
-                    result = add_quote_to_start(result, q_open)
+                    result = add_quote_to_start(result, q_open, tag_profile=tp)
                     trans_has_start = True
             elif need_end:
                 if not is_even or orig_quote_parity_odd:
-                    result = add_quote_to_end(result, q_close)
+                    result = add_quote_to_end(result, q_close, tag_profile=tp)
                     trans_has_end = True
             else:
                 pass
 
             if (not orig_has_start and trans_has_quote_start) and (not orig_has_end and trans_has_end):
-                result = remove_quote_from_start(result, force=True)
-                result = remove_quote_from_end(result, force=True)
+                result = remove_quote_from_start(result, force=True, tag_profile=tp)
+                result = remove_quote_from_end(result, force=True, tag_profile=tp)
             else:
                 if not orig_has_start and trans_has_quote_start:
-                    result = remove_quote_from_start(result)
+                    result = remove_quote_from_start(result, tag_profile=tp)
                 if not orig_has_end and trans_has_end:
-                    result = remove_quote_from_end(result)
+                    result = remove_quote_from_end(result, tag_profile=tp)
 
             if self.file_type in ["epub", "txt"]:
                 orig_has_dash = contains_dash(orig_line)
@@ -1814,18 +1870,18 @@ class FormattingSynchronizer:
 
                 if not orig_has_dash and trans_has_dash:
                     total_double_quote_count = _count_active_quotes(result)
-                    external_quote_count = count_external_quotes(result)
+                    external_quote_count = count_external_quotes(result, tag_profile=tp)
 
                     if total_double_quote_count % 2 != 0 and external_quote_count == 1:
                         result_stripped = result.lstrip()
                         if result_stripped and re.match(ALL_QUOTES, result_stripped):
                             if (total_double_quote_count - 1) % 2 == 0:
-                                result = remove_quote_from_start(result, force=True)
+                                result = remove_quote_from_start(result, force=True, tag_profile=tp)
                         else:
                             result_stripped_end = result.rstrip()
                             if result_stripped_end and re.match(ALL_QUOTES, result_stripped_end[-1]):
                                 if (total_double_quote_count - 1) % 2 == 0:
-                                    result = remove_quote_from_end(result, force=True)
+                                    result = remove_quote_from_end(result, force=True, tag_profile=tp)
 
             return result
 
@@ -1893,20 +1949,23 @@ class FormattingSynchronizer:
         return result
 
     def _remove_temporary_markers(self, text: str) -> str:
-        nt_markers = re.findall(r'<nt_\d{2}/>', text)
+        tp = self.tag_profile
+        nt_re = tp.non_trans_open_re()
+        nt_markers = [m.group(0) for m in nt_re.finditer(text)]
         if nt_markers:
             logger.warning(f"Found {len(nt_markers)} unreplaced NT markers - removing them")
             for marker in nt_markers:
                 logger.warning(f"  Unreplaced: {marker}")
 
-        cleaned = re.sub(r'<nt_\d{2}/>', '', text)
+        cleaned = nt_re.sub('', text)
 
-        ps_markers = re.findall(r'</?ps>', cleaned)
+        ps_any_re = re.compile(rf'</?{re.escape(tp.paragraph_separator)}>')
+        ps_markers = ps_any_re.findall(cleaned)
         if ps_markers:
             logger.warning(
                 f"Found {len(ps_markers)} unreplaced PS markers - removing them"
             )
-        cleaned = re.sub(r'</?ps>', '', cleaned)
+        cleaned = ps_any_re.sub('', cleaned)
 
         cleaned = re.sub(r'  +', ' ', cleaned)
 
