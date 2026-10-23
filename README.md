@@ -1,6 +1,21 @@
 # EPUB / SRT / TXT / PDF / Kindle / FB2 / DOCX Translator with LLM
 
-A desktop application for translating **EPUB**, **SRT**, **TXT**, **PDF**, **MOBI/AZW/AZW3**, **FB2**, and **DOCX** files using local or cloud-hosted language models.
+<p align="center">
+</p>
+
+
+<p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0-blue" />
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white" />
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-lightgrey" />
+  <img alt="CUDA" src="https://img.shields.io/badge/CUDA-11.8%20%7C%2012.1%20%7C%2012.4-76b900?logo=nvidia&logoColor=white" />
+  <img alt="Status" src="https://img.shields.io/badge/status-stable-brightgreen" />
+  <img alt="License" src="https://img.shields.io/badge/License-GPLv3-blue" />
+</p>
+
+A desktop application for translating **EPUB**, **SRT**, **TXT**, **ASS**, **PDF**, **MOBI/AZW/AZW3**, **FB2**, and **DOCX** files using local or cloud-hosted language models.
+
+---
 
 <img width="1502" height="850" alt="tar" src="https://github.com/user-attachments/assets/e367cca8-55c1-4fa4-ae2d-05d3ab494323" />
 
@@ -25,6 +40,21 @@ A desktop application for translating **EPUB**, **SRT**, **TXT**, **PDF**, **MOB
 
 ---
 
+## Changelog
+
+<details>
+<summary><b>Version history</b> (click to expand)</summary>
+
+<br>
+
+### [1.0.0] - 2026-10-23
+**Added**
+- Initial public release version 1.0.0.
+
+</details>
+
+---
+
 ## Supported formats
 
 | Format | Extensions | Notes |
@@ -36,6 +66,7 @@ A desktop application for translating **EPUB**, **SRT**, **TXT**, **PDF**, **MOB
 | Kindle | `.mobi` `.azw` `.azw3` | Extracted internally; AZW3 unpacked as EPUB structure |
 | FictionBook | `.fb2` | XML-based; sections, titles, paragraphs and epigraphs preserved |
 | Word | `.docx` | Heading styles detected automatically (`Heading 1`, `Heading 2`, etc.) |
+| ASS | `.ass` | Advanced SubStation Alpha subtitles; dialogue events with timestamps preserved, inline style tags (`{\i1}`, `{\b1}`, `{\u1}`, `{\p1}` drawings) handled by the parser |
 
 ---
 
@@ -94,11 +125,39 @@ Quick translation supports single fragments or all checked fragments in bulk. A 
 
 EPUB files contain HTML with inline formatting tags (`<i>`, `<b>`, `<span>`, `<em>`, `<strong>`, `<u>`, `<sup>`, `<sub>`, `<small>`) that should not be sent to an LLM as raw HTML. The application replaces them with numbered placeholders before translation and restores them afterward.
 
+> **Note — configurable tag names.**
+> All placeholder names shown on this page (`id_`, `p_`, `nt_`, `ps`, `z`) and the
+> response wrapper (`translated`) are **defaults**. They can all be renamed in
+> **Options → Tag Profile (Advanced)** if your model mangles the defaults.
+>
+> **If you change any of them, you must:**
+> 1. Update your prompt files (`.txt`) so the LLM uses the new names.
+> 2. Reload the current EPUB (Open File → same file) — existing fragments keep
+>    the *old* placeholder numbering in memory until reload.
+> 3. Saved sessions and already-translated fragments are unaffected — they
+>    retain the tag names they were created with.
+>
+> The parser has a hard-coded fallback to `<translated>` / `<translation>` for
+> the response wrapper, so an accidental mismatch there is non-fatal. Placeholder
+> prefixes have **no fallback** — a mismatch will leave raw `<p_01>` tokens in
+> the translated output.
+
+### Placeholder reference
+
+| Placeholder | Default | Setting key (in `tag_profile`) | UI label |
+|---|---|---|---|
+| `<id_01>` | `id_` | `reserve_prefix` | Reserve elements prefix |
+| `<p_01>...</p_01>` | `p_` | `inline_prefix` | Inline formatting prefix |
+| `<nt_01/>` | `nt_` | `non_trans_prefix` | Non-translatable marker prefix |
+| `<ps>` | `ps` | `paragraph_separator` | Paragraph separator |
+| `<z>` | `z` | `batch_separator` | Batch separator |
+| `<translated>` | `translated` | `response_wrapper_tag` (top-level, *not* in `tag_profile`) | Response Wrapper Tag |
+
 ### Inline mode (recommended for larger LLMs)
 
-All inline formatting tags are replaced with paired placeholders: `<p_01>...</p_01>`, `<p_02>...</p_02>`, etc.  
-Non-translatable content (padding spaces, empty anchors) is marked as `<nt_01/>`.  
-Structural elements (`img`, `code`, `br`, `hr`, `kbd`, `abbr`, `wbr`, `var`, `canvas`, `svg`, `script`, `style`, `math`) become `<id_01>` reserve markers.
+All inline formatting tags are replaced with paired placeholders: `<p_01>...</p_01>`, `<p_02>...</p_02>`, etc. *(default prefix: `p_`)*
+Non-translatable content (padding spaces, empty anchors) is marked as `<nt_01/>` *(default prefix: `nt_`)*.
+Structural elements (`img`, `code`, `br`, `hr`, `kbd`, `abbr`, `wbr`, `var`, `canvas`, `svg`, `script`, `style`, `math`) become `<id_01>` reserve markers *(default prefix: `id_`)*.
 
 After translation, placeholders are resolved back to the original tags in their correct positions.
 
@@ -107,17 +166,21 @@ It works best with larger, instruction-following LLMs that can reliably handle s
 
 ### Legacy mode
 
-Only structural reserve elements are protected (`<id_xx>`). Inline tags are not replaced with placeholders and are instead re-inserted after translation using a multilingual alignment model (see [Tag alignment](#tag-alignment-epub-legacy-mode)).
+Only structural reserve elements are protected (`<id_xx>`). Inline tags are not replaced with placeholders and are instead re-inserted after translation using a multilingual alignment model.
 
 ### Tags that can be individually skipped
 
 In Inline mode, specific tags can be excluded from placeholder substitution if an EPUB has broken or unreliable markup:  
 `<span>` · `<i>` · `<b>` · `<em>` · `<strong>` · `<u>` · `<sup>` · `<sub>` · `<small>`
 
+> `<a>` (inline links) cannot be skipped — it is always converted to a
+> placeholder because link targets must be preserved verbatim for the EPUB
+> writer. All other inline formatting tags above are toggleable.
+
 ### Paragraph structure
 
 Multi-paragraph elements can optionally preserve their internal paragraph breaks:
-- **Inline mode:** breaks are sent to the LLM as `<ps>` markers and restored after translation.
+- **Inline mode:** breaks are sent to the LLM as `<ps>` markers *(default separator: `ps` — configurable as `paragraph_separator` in Tag Profile)* and restored after translation.
 - **Legacy / TXT:** breaks are restored by proportional word-count split after translation.
 
 When disabled, all newlines within a fragment are flattened before sending.
@@ -162,26 +225,32 @@ When saving a Legacy-mode EPUB that contains aligned fragments, a dialog lets yo
 
 After each translation the application runs a series of checks and flags the fragment if any check fails. Flagged fragments are shown in red in the list.
 
-| Check | Description | Configurable |
-|-------|-------------|:---:|
-| Paragraph / line count | Number of paragraphs differs between original and translation | — |
-| First character type | Type of the leading character changed (uppercase, lowercase, digit, quote, special) | — |
-| Last character type | Ending punctuation type changed | — |
-| Length ratio | Translation length is disproportionate to the original | ✓ |
-| Quote parity | Odd number of double quotation marks in the translation | — |
-| Untranslated | Translation is identical to the original (ignores short texts, proper nouns, URLs, single tokens) | ✓ |
-| Reserve elements `<id_xx>` | Structural placeholders missing, duplicated, or spurious closing tags added | — |
-| NT markers `<nt_xx/>` | Non-translatable markers missing or extra (Inline mode only) | — |
-| Inline formatting `<p_xx>` | Opening/closing tags missing, extra, or unpaired (Inline mode only) | — |
+> All checks below can be toggled in **Options → Mismatch Detection Settings**.
+> Placeholder names (`<id_xx>`, `<nt_xx/>`, `<p_xx>`, `<ps>`) follow the
+> configurable Tag Profile — see [EPUB processing](#epub-processing).
+
+| Check | Description | Applies to | Toggle | Extra thresholds |
+|-------|-------------|:---:|:---:|:---:|
+| Paragraph / line count | Number of paragraphs differs between original and translation | All | ✓ | — |
+| First character type | Type of the leading character changed (uppercase, lowercase, digit, quote, special) | All | ✓ | — |
+| Last character type | Ending punctuation type changed | All | ✓ | — |
+| Length ratio | Translation length is disproportionate to the original | All | ✓ | ✓ |
+| Quote parity | Odd number of double quotation marks in the translation | All | ✓ | — |
+| Untranslated | Translation is identical to the original (ignores short texts, proper nouns, URLs, single tokens) | All | ✓ | ✓ |
+| Reserve elements `<id_xx>` | Structural placeholders missing, duplicated, or spurious closing tags added | EPUB only | ✓ | ✓ |
+| NT markers `<nt_xx/>` | Non-translatable markers missing or extra | EPUB Inline only | ✓ | ✓ |
+| Inline formatting `<p_xx>` | Opening/closing tags missing, extra, or unpaired | EPUB Inline only | ✓ | ✓ |
+| PS markers `<ps>` | Paragraph breaks present in original not reflected in translation | EPUB Inline only | ✗ *always on* | — |
 
 **Configurable thresholds:**
 
-- Length ratio: separate thresholds for short (≤100 chars), medium (≤500 chars), and long (>500 chars) texts. Texts ≤20 chars are always skipped.
-- Untranslated ratio: minimum fraction of lowercase-initial words required to trigger the check (default: 0.30).
-- Tag position shift for `<id_xx>` / `<nt_xx/>`: default 0.15.
-- Tag position shift for `<p_xx>` (inline formatting): default 0.30 — higher tolerance because translated words have different lengths.
+- **Length ratio (upper bound):** three separate thresholds depending on original text length — short (≤100 chars, default 1.6), medium (≤500 chars, default 1.4), long (>500 chars, default 1.3). Texts ≤20 chars are always skipped.
+- **Length ratio (lower bound / "too short"):** translation is flagged when shorter than a fraction of the original (default 0.45). Applied only when original ≥8 chars. Catches translations that skipped a large portion of the source.
+- **Untranslated ratio:** minimum fraction of lowercase-initial words required to trigger the "untranslated" check (default 0.30).
+- **Tag position shift for `<id_xx>` / `<nt_xx/>`:** default 0.15 — structural markers should stay put.
+- **Tag position shift for `<p_xx>` (inline formatting):** default 0.30 — higher tolerance because translated words have different lengths.
 
-A fragment can be manually marked as correct (suppresses mismatch flag) or flagged for review (force-mismatch).
+A fragment can be manually marked as correct (suppresses all mismatch flags, stored as `ignore_mismatch`) or flagged for review regardless of check results (stored as `force_mismatch`).
 
 ---
 
@@ -189,7 +258,7 @@ A fragment can be manually marked as correct (suppresses mismatch flag) or flagg
 
 If mismatch is detected and Auto-fix is enabled, the application retries the translation automatically. On each retry, the specific error details are appended to the prompt so the model can correct them. Temperature increases slightly on each attempt to discourage identical outputs. After all attempts are exhausted, the result with the fewest mismatch errors is returned.
 
-- Max attempts: 1–10 (default: 3)
+- Max attempts: 1–999 (default: 3)
 - Temperature increment: configurable per attempt
 
 ---
@@ -202,8 +271,10 @@ The application maintains separate prompt variants for each file type and proces
 |---------|----------|
 | `epub_inline` | EPUB in Inline mode |
 | `epub_legacy` | EPUB in Legacy mode, AZW3 |
-| `srt` | SRT files |
+| `srt` | SRT and ASS subtitle files |
 | `txt` | TXT, PDF, FB2, DOCX, MOBI |
+
+ASS files share the `srt` variant because both formats use the same line-by-line subtitle model: translation operates on `subtitle_block` elements, output lines are re-split by proportional word count, and inline style tags — `<i>`/`<b>` in SRT, `{\i1}`/`{\b1}`/`{\p1}` drawings in ASS — are re-inserted positionally by the writer (not via `<p_xx>` placeholders). Prompts therefore do not need to know which of the two formats produced the text.
 
 The variant is selected automatically based on the file type and, for Kindle files, on what was found inside the archive after extraction. AZW3 files unpack internally as an EPUB structure and are processed in Legacy mode — reserve element placeholders (`<id_xx>`) may be present, so they use `epub_legacy`. Plain MOBI files unpack as HTML and are processed as plain text with no placeholders, so they use `txt`. PDF, FB2 and DOCX processors also extract plain text only. Writers restore non-image reserve elements (`<br>`, `<code>`, etc.) where the output format supports them, and silently drop image placeholders since the new file has no embedded image resources.
 
@@ -230,7 +301,7 @@ Context is provided as read-only reference — only the current fragment is tran
 
 Multiple fragments can be combined into a single LLM request to reduce API call overhead and speed up translation. Fragments are joined with a `<z>` separator marker; the model is instructed to preserve all markers and return the same number of segments. The response is then split back and mapped to the original fragments.
 
-- **Batch size:** 2–20 fragments per request (default: 5)
+- **Batch size:** 2–999 fragments per request (default: 5)
 - Works in both **Inline** and **Legacy** mode
 - Fragments from different chapters are never merged into the same batch
 - Available for EPUB files only (disabled automatically for other formats)
@@ -396,7 +467,7 @@ A separate full-screen reader window can be opened from the preview toolbar. The
 Open file → Select fragments → Configure LLM → Translate → Review → Save file
 ```
 
-1. **Open file** — EPUB, SRT, TXT, PDF, MOBI/AZW, FB2 or DOCX via `📂 Open File`.
+1. **Open file** — EPUB, SRT, TXT, ASS, PDF, MOBI/AZW, FB2 or DOCX via `📂 Open File`.
 2. **Options tab** — select backend, enter API keys or model name, click **Save Settings**.
 3. **Select fragments** — checkboxes in the list; `Select All`, `Select Untranslated`, `Select Mismatch`, or Shift+click for range selection. Searchable by original or translated text.
 4. **Translate** — `▶ Translate Selected`. Status bar shows fragment index, progress count, elapsed time, timeout, and auto-fix attempt number.
