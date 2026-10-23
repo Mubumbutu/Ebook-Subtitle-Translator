@@ -5,6 +5,8 @@ import os
 import re
 
 from lxml import etree
+from typing import Optional
+from app_utils import TagProfile
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer, QUrl
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut
 from PyQt6.QtWebEngineCore import QWebEnginePage
@@ -385,7 +387,7 @@ div, article, section, main, p, span, li, td, th, blockquote, header, footer, na
 a { color: #7a4f1f !important; }
 """
 
-_SEPIA_FORCE_JS = """
+_SEPIA_FORCE_JS = r"""
 (function(){
     var BG = '#e8dcc8';
     var FG = '#2c1a0e';
@@ -535,12 +537,13 @@ class EPUBReaderWindow(QMainWindow):
     closed = pyqtSignal()
 
     def __init__(self, book, paragraphs, selected_para,
-                 dark_mode: bool = False, parent=None):
+                 dark_mode: bool = False, parent=None,
+                 tag_profile: Optional[TagProfile] = None):
         super().__init__(parent)
         self.setWindowTitle("EPUB Reader")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
-        self._engine      = EPUBPreviewEngine()
+        self._engine      = EPUBPreviewEngine(tag_profile=tag_profile)
         self._book        = book
         self._paragraphs  = paragraphs
         self._dark_mode   = dark_mode
@@ -849,7 +852,8 @@ class GenericReaderWindow(QMainWindow):
     closed = pyqtSignal()
 
     def __init__(self, file_type: str, source, paragraphs, selected_para,
-                 dark_mode: bool = False, parent=None):
+                 dark_mode: bool = False, parent=None,
+                 tag_profile: Optional[TagProfile] = None):
         super().__init__(parent)
         self.setWindowTitle(f"{file_type.upper()} Reader")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
@@ -859,6 +863,7 @@ class GenericReaderWindow(QMainWindow):
         self._paragraphs   = paragraphs
         self._dark_mode    = dark_mode
         self._sepia_mode   = False
+        self._tag_profile  = tag_profile or TagProfile()
         self._chapters     = EPUBPreviewEngine.get_chapter_list(paragraphs)
         self._current_href = selected_para.get('item_href', '')
         try:
@@ -1055,7 +1060,7 @@ class GenericReaderWindow(QMainWindow):
                     reader_mode=True, sepia_mode=self._sepia_mode,
                 )
             elif ft == 'mobi':
-                engine = MobiPreviewEngine()
+                engine = MobiPreviewEngine(tag_profile=self._tag_profile)
                 html_str = engine.generate_preview_html(
                     self._source, self._paragraphs, representative_para,
                     show_original_ids=None, dark_mode=self._dark_mode,
@@ -1106,7 +1111,7 @@ class GenericReaderWindow(QMainWindow):
                     self._source, paragraphs, self._current_href
                 )
             elif ft == 'mobi':
-                js = MobiPreviewEngine().generate_refresh_js(
+                js = MobiPreviewEngine(tag_profile=self._tag_profile).generate_refresh_js(
                     self._source, paragraphs, self._current_href
                 )
             elif ft == 'pdf':
@@ -1183,8 +1188,9 @@ class EPUBPreviewEngine:
     serialised to a string.
     """
 
-    def __init__(self):
+    def __init__(self, tag_profile: Optional[TagProfile] = None):
         self._ns = {'x': XHTML_NS}
+        self.tag_profile = tag_profile or TagProfile()
 
     @staticmethod
     def get_chapter_list(paragraphs: list) -> list:
@@ -1365,17 +1371,9 @@ class EPUBPreviewEngine:
         self._replace_element_content_with_html(element, translation)
 
     def _inject_inline(self, element, para):
-        """
-        Inject translation for an inline-mode paragraph.
+        tp = self.tag_profile
+        ps_any_re = re.compile(rf'</?{re.escape(tp.paragraph_separator)}(?:_\d{{2}})?>')
 
-        Restores all placeholder types:
-          - auto-wrap outer tags
-          - prefix / suffix reserve tags
-          - non-translatable <nt_XX/> markers
-          - <id_XX> reserve-element placeholders
-          - <p_XX> / </p_XX> inline-formatting placeholders
-        Then rebuilds the element DOM from the resulting text.
-        """
         translated_text = para.get('translated_text', '')
         inline_map      = para.get('inline_formatting_map', {})
         non_trans_map   = para.get('non_translatable_placeholders', {})
@@ -1391,7 +1389,7 @@ class EPUBPreviewEngine:
             full_text = full_text.replace('\n', ' ')
             full_text = re.sub(r'  +', ' ', full_text)
 
-        full_text = re.sub(r'</?ps(?:_\d{2})?>', '', full_text)
+        full_text = ps_any_re.sub('', full_text)
         full_text = re.sub(r'  +', ' ', full_text)
 
         for tag_info in reversed(auto_wrap_tags):
@@ -1405,7 +1403,7 @@ class EPUBPreviewEngine:
             full_text = full_text.rstrip() + ' ' + ' '.join(suffix_tags)
 
         for tag_id, info in non_trans_map.items():
-            marker   = f'<nt_{int(tag_id):02d}/>'
+            marker   = tp.non_trans_placeholder(int(tag_id))
             original = info.get('full_match', '')
             if marker in full_text:
                 full_text = full_text.replace(marker, original)
@@ -1421,12 +1419,9 @@ class EPUBPreviewEngine:
         )
 
     def _restore_reserve_placeholders(self, text, para):
-        """Replace <id_XX> placeholders with their stored HTML strings."""
-        reserve_elements    = para.get('reserve_elements', [])
-        placeholder_pattern = para.get('placeholder_pattern', '<id_{:02d}>')
+        reserve_elements = para.get('reserve_elements', [])
         for i, html_str in enumerate(reserve_elements):
-            placeholder = placeholder_pattern.format(i)
-            text = text.replace(placeholder, html_str)
+            text = text.replace(self.tag_profile.reserve_placeholder(i), html_str)
         return text
 
     def _replace_element_content_with_html(self, element, html_content):
@@ -1461,25 +1456,20 @@ class EPUBPreviewEngine:
     def _rebuild_element_from_placeholders(
         self, parent, text, formatting_map, reserve_elements
     ):
-        """
-        Walk *text* token by token, creating child lxml elements for
-        <p_XX> / </p_XX> inline-tag markers and <id_XX> reserve-element
-        markers.  Plain text between markers is appended as text/tail nodes.
-
-        This is a faithful simplified copy of the same method in
-        EPUBCreatorLxml, kept here so the preview module stays self-contained
-        and independent of epub_creator_lxml.py.
-        """
-        pattern  = r'<p_(\d{2})>|</p_(\d{2})>|<id_(\d{2})>'
+        tp = self.tag_profile
+        pattern = re.compile('|'.join([
+            tp.inline_open_re().pattern,
+            tp.inline_close_re().pattern,
+            tp.reserve_open_re().pattern,
+        ]))
         stack    = [(parent, None)]
         buffer   = ''
         last_pos = 0
 
-        for match in re.finditer(pattern, text):
+        for match in pattern.finditer(text):
             buffer += text[last_pos:match.start()]
-            placeholder = match.group(0)
 
-            if placeholder.startswith('<p_') and not placeholder.startswith('</p_'):
+            if match.group(1) is not None:
                 tag_id = int(match.group(1))
 
                 if buffer:
@@ -1513,7 +1503,7 @@ class EPUBPreviewEngine:
                         f'[EPUBPreview] _rebuild: tag_id {tag_id} not in formatting_map, skipped.'
                     )
 
-            elif placeholder.startswith('</p_'):
+            elif match.group(2) is not None:
                 tag_id = int(match.group(2))
 
                 if buffer:
@@ -1530,10 +1520,10 @@ class EPUBPreviewEngine:
                                 buffer += ' '
                 else:
                     logger.debug(
-                        f'[EPUBPreview] _rebuild: stack mismatch on </p_{tag_id:02d}>'
+                        f'[EPUBPreview] _rebuild: stack mismatch on {tp.inline_close_placeholder(tag_id)}'
                     )
 
-            elif placeholder.startswith('<id_'):
+            elif match.group(3) is not None:
                 reserve_id = int(match.group(3))
 
                 if buffer:
@@ -2175,6 +2165,9 @@ p.paragraph { margin: 0.6em 0; }
 class MobiPreviewEngine:
     """Preview engine for Mobi/AZW3 files."""
 
+    def __init__(self, tag_profile: Optional[TagProfile] = None):
+        self.tag_profile = tag_profile or TagProfile()
+
     @staticmethod
     def get_chapter_list(paragraphs: list) -> list:
         seen = []
@@ -2237,7 +2230,7 @@ class MobiPreviewEngine:
             try:
                 import epub_utils
                 book = epub_utils.read_epub(epub_path)
-                engine = EPUBPreviewEngine()
+                engine = EPUBPreviewEngine(tag_profile=self.tag_profile)
                 if reader_mode:
                     css_extra = _READER_PAGE_CSS
                     if sepia_mode:
