@@ -6,6 +6,7 @@ import re
 import traceback
 import unicodedata
 from epub_utils import write_epub
+from app_utils import TagProfile
 from format_alignment import FormatAlignmentEngine
 from lxml import etree
 from PyQt6.QtCore import pyqtSignal, QThread
@@ -17,11 +18,12 @@ class EPUBCreatorLxml(QThread):
     finished = pyqtSignal(str, bool)
 
 
-    def __init__(self, book, paragraphs, output_path):
+    def __init__(self, book, paragraphs, output_path, tag_profile=None):
         super().__init__()
         self.book = book
         self.paragraphs = paragraphs
         self.output_path = output_path
+        self.tag_profile = tag_profile or TagProfile()
 
         self.ns = {
             'x': 'http://www.w3.org/1999/xhtml'
@@ -525,6 +527,7 @@ class EPUBCreatorLxml(QThread):
     def _restore_legacy_translation(self, element, para):
         logger.debug("Using LEGACY restoration")
 
+        tp = self.tag_profile
         translated_text = para['translated_text']
         reserve_elements = para.get('reserve_elements', [])
         prefix_tags = para.get('prefix_reserve_tags', [])
@@ -538,7 +541,7 @@ class EPUBCreatorLxml(QThread):
             full_text += " " + tag
 
         for idx, reserve_html in enumerate(reserve_elements):
-            placeholder = f'<id_{idx:02d}>'
+            placeholder = tp.reserve_placeholder(idx)
             full_text = full_text.replace(placeholder, reserve_html)
 
         try:
@@ -564,6 +567,13 @@ class EPUBCreatorLxml(QThread):
         logger.debug(f"\n=== RESTORE TRANSLATION ===")
         logger.debug(f"Element ID: {element.get('id', 'UNKNOWN')}")
 
+        tp = self.tag_profile
+        ip = re.escape(tp.inline_prefix)
+        ps = re.escape(tp.paragraph_separator)
+        inline_any_re = re.compile(rf'</?{ip}\d{{2}}>')
+        inline_close_pat = rf'</{ip}\d{{2}}>'
+        ps_any_re = re.compile(rf'</?{ps}(?:_\d{{2}})?>')
+
         translated_text = para.get('translated_text', '')
         inline_formatting_map = para.get('inline_formatting_map', {})
         reserve_elements = para.get('reserve_elements', [])
@@ -579,23 +589,23 @@ class EPUBCreatorLxml(QThread):
             translated_text = re.sub(r'  +', ' ', translated_text)
             logger.debug(f"Cleaned \\n from translated_text")
 
-        _has_ps_tag = bool(re.search(r'</?ps(?:_\d{2})?>', translated_text))
+        _has_ps_tag = bool(ps_any_re.search(translated_text))
         if _has_ps_tag:
-            ps_count = len(re.findall(r'</?ps(?:_\d{2})?>', translated_text))
+            ps_count = len(ps_any_re.findall(translated_text))
             logger.warning(
-                f"Found {ps_count} unreplaced <ps>/<ps> or <ps_NN> markers in translated_text "
+                f"Found {ps_count} unreplaced paragraph separator markers in translated_text "
                 f"for element {para.get('id', '?')} – removing them"
             )
-            translated_text = re.sub(r'</?ps(?:_\d{2})?>', '', translated_text)
+            translated_text = ps_any_re.sub('', translated_text)
             translated_text = re.sub(r'  +', ' ', translated_text)
 
         translated_text = re.sub(
-            r'(</p_\d{2}>)[ \t\u00a0]+([,;:!?.])',
+            rf'({inline_close_pat})[ \t\u00a0]+([,;:!?.])',
             r'\1\2',
             translated_text
         )
         translated_text = re.sub(
-            r'[ \t\u00a0]+(</p_\d{2}>)',
+            rf'[ \t\u00a0]+({inline_close_pat})',
             r'\1 ',
             translated_text
         )
@@ -645,11 +655,11 @@ class EPUBCreatorLxml(QThread):
         expected_inline_count = max(0, expected_inline_count)
         expected_reserve_count = len(reserve_elements)
 
-        has_inline_placeholders = bool(re.search(r'</?p_\d{2}>', translated_text))
-        has_reserve_placeholders = bool(re.search(r'<id_\d{2}>', translated_text))
+        has_inline_placeholders = bool(inline_any_re.search(translated_text))
+        has_reserve_placeholders = bool(tp.reserve_open_re().search(translated_text))
 
-        actual_inline_count = len(re.findall(r'<p_\d{2}>', translated_text))
-        actual_reserve_count = len(re.findall(r'<id_\d{2}>', translated_text))
+        actual_inline_count = len(tp.inline_open_re().findall(translated_text))
+        actual_reserve_count = len(tp.reserve_open_re().findall(translated_text))
 
         logger.debug("Placeholder check:")
         logger.debug(f"  Expected inline (excl. auto_wrap={auto_wrap_tag_count}): {expected_inline_count}, found: {actual_inline_count}")
@@ -676,10 +686,10 @@ class EPUBCreatorLxml(QThread):
         if placeholders_missing:
             logger.warning(f"Translation text preview: {repr(translated_text[:150])}")
             logger.warning("🔧 FALLBACK: Attempting text-only replacement...")
-            clean_translated = re.sub(r'</?p_\d{2}>', '', translated_text)
-            clean_translated = re.sub(r'<id_\d{2}>', '', clean_translated)
-            clean_translated = re.sub(r'</id_\d{2}>', '', clean_translated)
-            clean_translated = re.sub(r'<nt_\d{2}/>', ' ', clean_translated)
+            clean_translated = inline_any_re.sub('', translated_text)
+            clean_translated = tp.reserve_open_re().sub('', clean_translated)
+            clean_translated = tp.reserve_close_re().sub('', clean_translated)
+            clean_translated = tp.non_trans_open_re().sub(' ', clean_translated)
             clean_translated = re.sub(r'  +', ' ', clean_translated).strip()
             self._fallback_text_only_replacement(element, clean_translated)
             if had_drop_cap:
@@ -706,7 +716,7 @@ class EPUBCreatorLxml(QThread):
 
         for tag_id in sorted(non_translatable.keys()):
             info = non_translatable[tag_id]
-            marker = f'<nt_{int(tag_id):02d}/>'
+            marker = tp.non_trans_placeholder(int(tag_id))
             original = info.get('full_match', '')
             if marker in full_text:
                 full_text = full_text.replace(marker, original)
@@ -2443,7 +2453,15 @@ class EPUBCreatorLxml(QThread):
         logger.debug(f"Formatting map: {len(formatting_map)} entries")
         logger.debug(f"Reserve elements: {len(reserve_elements)} entries")
 
-        pattern = r'<p_(\d{2})>|</p_(\d{2})>|<id_(\d{2})>'
+        tp = self.tag_profile
+
+        pattern = re.compile(
+            '|'.join([
+                tp.inline_open_re().pattern,
+                tp.inline_close_re().pattern,
+                tp.reserve_open_re().pattern,
+            ])
+        )
 
         stack = [(parent, None)]
 
@@ -2452,24 +2470,22 @@ class EPUBCreatorLxml(QThread):
 
         match_count = 0
 
-        for match in re.finditer(pattern, text):
+        for match in pattern.finditer(text):
             match_count += 1
 
             buffer += text[last_pos:match.start()]
 
-            placeholder = match.group(0)
-
-            if placeholder.startswith('<p_') and not placeholder.startswith('</p_'):
+            if match.group(1) is not None:
                 tag_id = int(match.group(1))
 
-                logger.debug(f"  [{match_count}] Opening <p_{tag_id:02d}>")
+                logger.debug(f"  [{match_count}] Opening {tp.inline_open_placeholder(tag_id)}")
 
                 if buffer:
                     if tag_id in formatting_map:
                         info = formatting_map[tag_id]
                         if info.get('has_leading_space', False) and not buffer[-1].isspace():
                             buffer += ' '
-                            logger.debug(f"      Restored leading space before <p_{tag_id:02d}>")
+                            logger.debug(f"      Restored leading space before {tp.inline_open_placeholder(tag_id)}")
 
                     self._append_text_to_element(stack[-1][0], buffer)
                     logger.debug(f"      Flushed buffer ({len(buffer)} chars)")
@@ -2485,12 +2501,12 @@ class EPUBCreatorLxml(QThread):
                                 last_tail = last_child.tail or ''
                                 if not last_tail or not last_tail[-1].isspace():
                                     last_child.tail = last_tail + ' '
-                                    logger.debug(f"      Restored leading space (via tail) before <p_{tag_id:02d}>")
+                                    logger.debug(f"      Restored leading space (via tail) before {tp.inline_open_placeholder(tag_id)}")
                             else:
                                 parent_txt = current_parent.text or ''
                                 if not parent_txt or not parent_txt[-1].isspace():
                                     current_parent.text = parent_txt + ' '
-                                    logger.debug(f"      Restored leading space (via parent.text) before <p_{tag_id:02d}>")
+                                    logger.debug(f"      Restored leading space (via parent.text) before {tp.inline_open_placeholder(tag_id)}")
 
                 if tag_id in formatting_map:
                     info = formatting_map[tag_id]
@@ -2501,10 +2517,10 @@ class EPUBCreatorLxml(QThread):
                 else:
                     logger.warning(f"      ⚠️ Tag ID {tag_id} not in formatting_map - skipping")
 
-            elif placeholder.startswith('</p_'):
+            elif match.group(2) is not None:
                 tag_id = int(match.group(2))
 
-                logger.debug(f"  [{match_count}] Closing </p_{tag_id:02d}>")
+                logger.debug(f"  [{match_count}] Closing {tp.inline_close_placeholder(tag_id)}")
 
                 if buffer:
                     self._append_text_to_element(stack[-1][0], buffer)
@@ -2522,14 +2538,14 @@ class EPUBCreatorLxml(QThread):
 
                             if next_char and not next_char.isspace() and next_char not in '.,;:!?':
                                 buffer += ' '
-                                logger.debug(f"      Restored trailing space after </p_{tag_id:02d}>")
+                                logger.debug(f"      Restored trailing space after {tp.inline_close_placeholder(tag_id)}")
                 else:
                     logger.warning(f"      ⚠️ Stack mismatch: expected {stack[-1][1]}, got {tag_id}")
 
-            elif placeholder.startswith('<id_'):
+            elif match.group(3) is not None:
                 reserve_id = int(match.group(3))
 
-                logger.debug(f"  [{match_count}] Reserve <id_{reserve_id:02d}>")
+                logger.debug(f"  [{match_count}] Reserve {tp.reserve_placeholder(reserve_id)}")
 
                 if buffer:
                     self._append_text_to_element(stack[-1][0], buffer)
@@ -2641,6 +2657,7 @@ class EPUBCreatorLxml(QThread):
 
     def _restore_reserved_elements(self, translation, para):
         result = translation
+        tp = self.tag_profile
 
         prefix_tags = para.get('prefix_reserve_tags', [])
         suffix_tags = para.get('suffix_reserve_tags', [])
@@ -2658,10 +2675,8 @@ class EPUBCreatorLxml(QThread):
         if 'reserve_elements' in para and para['reserve_elements']:
             logger.debug(f"Restoring {len(para['reserve_elements'])} reserve elements")
 
-            placeholder_pattern = para.get('placeholder_pattern', '<id_{:02d}>')
-
             for idx, element_html in enumerate(para['reserve_elements']):
-                placeholder = placeholder_pattern.format(idx)
+                placeholder = tp.reserve_placeholder(idx)
 
                 clean_html = re.sub(r'\s+xmlns(?::\w+)?="[^"]*"', '', element_html)
 
