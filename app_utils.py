@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import os
+import re
 from lxml import etree
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,6 +34,7 @@ class SessionManager:
         top_p: float = 0.0,
         top_k: int = 0,
         timeout_minutes: int = 10,
+        enable_thinking: bool = True,
         source_lang: str = "",
         target_lang: str = "",
         quick_translate_service: str = "Google (Free)"
@@ -82,6 +84,7 @@ class SessionManager:
             'top_p': top_p,
             'top_k': top_k,
             'timeout_minutes': timeout_minutes,
+            'enable_thinking': enable_thinking,
             'source_lang': source_lang,
             'target_lang': target_lang,
             'quick_translate_service': quick_translate_service,
@@ -167,6 +170,7 @@ class SessionManager:
                 'top_p': session_data.get('top_p', 0.0),
                 'top_k': session_data.get('top_k', 0),
                 'timeout_minutes': session_data.get('timeout_minutes', 10),
+                'enable_thinking': session_data.get('enable_thinking', True),
                 'source_lang': session_data.get('source_lang', ''),
                 'target_lang': session_data.get('target_lang', ''),
                 'quick_translate_service': session_data.get('quick_translate_service', 'Google (Free)'),
@@ -240,6 +244,89 @@ class SessionManager:
 
         return ' '.join(text_content.split())
 
+class TagProfile:
+    def __init__(
+        self,
+        reserve_prefix: str = "id_",
+        inline_prefix: str = "p_",
+        non_trans_prefix: str = "nt_",
+        paragraph_separator: str = "ps",
+        batch_separator: str = "z",
+    ):
+        self.reserve_prefix = reserve_prefix
+        self.inline_prefix = inline_prefix
+        self.non_trans_prefix = non_trans_prefix
+        self.paragraph_separator = paragraph_separator
+        self.batch_separator = batch_separator
+
+    @staticmethod
+    def from_settings(settings_dict: Optional[Dict]) -> "TagProfile":
+        defaults = TagProfile()
+        raw = settings_dict.get("tag_profile") if isinstance(settings_dict, dict) else None
+        if not isinstance(raw, dict):
+            raw = {}
+
+        def pick(key: str, default: str) -> str:
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            return default
+
+        return TagProfile(
+            reserve_prefix=pick("reserve_prefix", defaults.reserve_prefix),
+            inline_prefix=pick("inline_prefix", defaults.inline_prefix),
+            non_trans_prefix=pick("non_trans_prefix", defaults.non_trans_prefix),
+            paragraph_separator=pick("paragraph_separator", defaults.paragraph_separator),
+            batch_separator=pick("batch_separator", defaults.batch_separator),
+        )
+
+    def reserve_open_re(self) -> re.Pattern:
+        return re.compile(rf'<{re.escape(self.reserve_prefix)}(\d{{2}})>')
+
+    def reserve_close_re(self) -> re.Pattern:
+        return re.compile(rf'</{re.escape(self.reserve_prefix)}(\d{{2}})>')
+
+    def inline_open_re(self) -> re.Pattern:
+        return re.compile(rf'<{re.escape(self.inline_prefix)}(\d{{2}})>')
+
+    def inline_close_re(self) -> re.Pattern:
+        return re.compile(rf'</{re.escape(self.inline_prefix)}(\d{{2}})>')
+
+    def non_trans_open_re(self) -> re.Pattern:
+        return re.compile(rf'<{re.escape(self.non_trans_prefix)}(\d{{2}})/>')
+
+    def paragraph_sep_re(self) -> re.Pattern:
+        return re.compile(rf'<{re.escape(self.paragraph_separator)}>')
+
+    def batch_sep_re(self) -> re.Pattern:
+        return re.compile(rf'<{re.escape(self.batch_separator)}>')
+
+    def all_placeholders_re(self) -> re.Pattern:
+        reserve = re.escape(self.reserve_prefix)
+        inline = re.escape(self.inline_prefix)
+        non_trans = re.escape(self.non_trans_prefix)
+        paragraph = re.escape(self.paragraph_separator)
+        batch = re.escape(self.batch_separator)
+        return re.compile(
+            rf'</?{reserve}\d{{2}}>'
+            rf'|</?{inline}\d{{2}}>'
+            rf'|<{non_trans}\d{{2}}/>'
+            rf'|</?{paragraph}>'
+            rf'|<{batch}>'
+        )
+
+    def reserve_placeholder(self, n: int) -> str:
+        return f'<{self.reserve_prefix}{n:02d}>'
+
+    def inline_open_placeholder(self, n: int) -> str:
+        return f'<{self.inline_prefix}{n:02d}>'
+
+    def inline_close_placeholder(self, n: int) -> str:
+        return f'</{self.inline_prefix}{n:02d}>'
+
+    def non_trans_placeholder(self, n: int) -> str:
+        return f'<{self.non_trans_prefix}{n:02d}/>'
+
 class AppSettingsManager:
     SETTINGS_FILE = "app_settings.json"
 
@@ -260,6 +347,8 @@ class AppSettingsManager:
         "quote_style": "neutral",
         "skip_inline_tags": {},
         "auto_save_interval": 1,
+        "enable_thinking": False,
+        "response_wrapper_tag": "translated",
         "mismatch_checks": {
             "paragraphs": True,
             "first_char": True,
@@ -280,8 +369,15 @@ class AppSettingsManager:
             "inline_position_shift_threshold": 0.30,
         },
         "alignment_settings": {
-            "device":     "cpu",
+            "device": "cpu",
             "model_name": "xlm-roberta-large",
+        },
+        "tag_profile": {
+            "reserve_prefix": "id_",
+            "inline_prefix": "p_",
+            "non_trans_prefix": "nt_",
+            "paragraph_separator": "ps",
+            "batch_separator": "z",
         },
     }
 
@@ -321,6 +417,7 @@ class AppSettingsManager:
             "mismatch_thresholds",
             "skip_inline_tags",
             "alignment_settings",
+            "tag_profile",
         ):
             default_nested = AppSettingsManager.DEFAULT_SETTINGS.get(nested_key, {})
             if not isinstance(settings.get(nested_key), dict):
@@ -578,7 +675,12 @@ Context in <context_before>/<context_after> is for reference only."""
 
 6. Keep URLs, emails, proper nouns as-is.
 
-7. Maintain natural Polish subtitle flow."""
+7. LINE PRESERVATION:
+- If the text contains <ps> markers, preserve them EXACTLY — do not remove, add, or move them
+- Each <ps> represents a line break; the translation must have the same number of <ps> markers as the original
+- Do NOT translate, rename, or omit <ps>
+
+8. Maintain natural Polish subtitle flow."""
 
         elif variant == "epub_legacy":
             return base + """
