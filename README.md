@@ -5,7 +5,7 @@
 
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-blue" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-lightgrey" />
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-11.8%20%7C%2012.1%20%7C%2012.4-76b900?logo=nvidia&logoColor=white" />
@@ -46,6 +46,17 @@ A desktop application for translating **EPUB**, **SRT**, **TXT**, **ASS**, **PDF
 <summary><b>Version history</b> (click to expand)</summary>
 
 <br>
+
+### [1.1.0] - 2026-11-01
+**Added**
+- Added a new **LLM Prompt** tab that displays the complete prompt sent to the LLM.
+
+**Changed**
+- Updated the options in the **Tag Profile (Advanced)** tab.
+- Improved the logic of the **Alignment** function for lighter LLM models that are unable to correctly insert tags into translations.
+
+**Fixed**
+- Minor fixes and improvements.
 
 ### [1.0.0] - 2026-10-23
 **Added**
