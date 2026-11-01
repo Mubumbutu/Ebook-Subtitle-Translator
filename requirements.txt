@@ -1,4 +1,7 @@
-PyQt6>=6.4.0
+PyQt6==6.9.1
+PyQt6-Qt6==6.9.1
+PyQt6-WebEngine==6.9.0
+PyQt6-WebEngine-Qt6==6.9.0
 lxml>=4.9.0
 ebooklib>=0.18
 requests>=2.28.0
@@ -6,7 +9,9 @@ openrouter
 deep-translator
 deepl
 transformers>=4.35.0
-PyQt6-WebEngine
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+tiktoken>=0.5.0
 PyMuPDF
 mobi
 python-docx
