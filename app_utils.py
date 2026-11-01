@@ -4,10 +4,58 @@ import json
 import logging
 import os
 import re
+import functools as _functools
 from lxml import etree
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+WRAPPER_TAG_FALLBACKS = ("translated", "translation")
+WRAPPER_TAG_NAME_RE = re.compile(r'^[^\W\d_][^\s<>/&"=\x27]*$')
+
+
+def is_valid_wrapper_variant_name(name: Any) -> bool:
+    return isinstance(name, str) and bool(WRAPPER_TAG_NAME_RE.match(name.strip()))
+
+
+def normalize_wrapper_variants(variants: Any, primary: str = "") -> List[str]:
+    if not isinstance(variants, (list, tuple)):
+        return []
+    primary_key = (primary or "").strip().lower()
+    reserved = set(WRAPPER_TAG_FALLBACKS)
+    result: List[str] = []
+    seen = set()
+    for item in variants:
+        if not isinstance(item, str):
+            continue
+        name = item.strip()
+        if not is_valid_wrapper_variant_name(name):
+            continue
+        key = name.lower()
+        if key == primary_key or key in reserved or key in seen:
+            continue
+        seen.add(key)
+        result.append(name)
+    return result
+
+
+def wrapper_tag_names(primary: str, variants: Any = None) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    candidates = [(primary or "").strip() or "translated"]
+    candidates.extend(normalize_wrapper_variants(variants, primary))
+    candidates.extend(WRAPPER_TAG_FALLBACKS)
+    for name in candidates:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def build_wrapper_tags_pattern(primary: str, variants: Any = None) -> str:
+    return "(?:" + "|".join(re.escape(n) for n in wrapper_tag_names(primary, variants)) + ")"
 
 class SessionManager:
     @staticmethod
@@ -37,10 +85,22 @@ class SessionManager:
         enable_thinking: bool = True,
         source_lang: str = "",
         target_lang: str = "",
-        quick_translate_service: str = "Google (Free)"
+        quick_translate_service: str = "Google (Free)",
+        source_format: str = "",
+        tag_profile_dict: Optional[Dict] = None,
+        response_wrapper_tag: str = "",
+        batch_json_payload_template: str = "",
+        json_payload_batch: bool = False,
     ) -> None:
         _NON_SERIALISABLE = frozenset({
             'auto_fix_history',
+            '_had_newlines',
+            '_original_parts',
+            '_original_separators',
+            '_used_ps_marker',
+            'use_ps_markers',
+            'index',
+            'llm_prompt',
         })
 
         paragraphs_to_save = []
@@ -62,9 +122,24 @@ class SessionManager:
 
         skip_inline_tags = app_settings.get('skip_inline_tags', {})
 
+        effective_tag_profile = tag_profile_dict
+        if not isinstance(effective_tag_profile, dict) or not effective_tag_profile:
+            effective_tag_profile = app_settings.get('tag_profile', {}) or {}
+
+        effective_wrapper = (response_wrapper_tag or '').strip()
+        if not effective_wrapper:
+            effective_wrapper = app_settings.get('response_wrapper_tag', 'translated') or 'translated'
+
+        effective_variants = normalize_wrapper_variants(
+            app_settings.get('response_wrapper_tag_variants'),
+            effective_wrapper
+        )
+
         session_data = {
+            'session_version': 2,
             'original_file_path': original_file_path,
             'file_type': file_type,
+            'source_format': source_format or file_type,
             'paragraphs': paragraphs_to_save,
             'context_before': context_before,
             'context_after': context_after,
@@ -72,10 +147,16 @@ class SessionManager:
             'custom_ollama_prompt': custom_prompts.get('ollama'),
             'custom_system_prompt': custom_prompts.get('system'),
             'custom_assistant_prompt': custom_prompts.get('assistant'),
+            'custom_batch_assistant_prompt': custom_prompts.get('batch_assistant'),
             'custom_user_prompt': custom_prompts.get('user'),
+            'custom_json_payload_prompt': custom_prompts.get('json_payload'),
+            'custom_batch_json_payload_prompt': custom_prompts.get('batch_json_payload'),
+            'custom_batch_hint_prompt': custom_prompts.get('batch_hint'),
             'single_prompt_mode': single_prompt_mode,
             'json_payload_mode': json_payload_mode,
             'json_payload_template': json_payload_template,
+            'batch_json_payload_template': batch_json_payload_template,
+            'json_payload_batch': json_payload_batch,
             'json_response_field': json_response_field,
             'sentence_batch_enabled': sentence_batch_enabled,
             'sentence_batch_size': sentence_batch_size,
@@ -88,11 +169,13 @@ class SessionManager:
             'source_lang': source_lang,
             'target_lang': target_lang,
             'quick_translate_service': quick_translate_service,
-
             'metadata': {
                 'processing_mode': processing_mode,
                 'prompt_variant': prompt_variant,
-                'skip_inline_tags': skip_inline_tags
+                'skip_inline_tags': skip_inline_tags,
+                'tag_profile': effective_tag_profile,
+                'response_wrapper_tag': effective_wrapper,
+                'response_wrapper_tag_variants': effective_variants,
             }
         }
 
@@ -137,11 +220,32 @@ class SessionManager:
             elif skip_inline_tags is None:
                 skip_inline_tags = {}
 
+            tag_profile = metadata.get('tag_profile')
+            if not isinstance(tag_profile, dict) or not tag_profile:
+                tag_profile = None
+
+            response_wrapper_tag = metadata.get('response_wrapper_tag')
+            if not isinstance(response_wrapper_tag, str) or not response_wrapper_tag.strip():
+                response_wrapper_tag = None
+
+            raw_wrapper_variants = metadata.get('response_wrapper_tag_variants')
+            if isinstance(raw_wrapper_variants, list):
+                response_wrapper_tag_variants = normalize_wrapper_variants(
+                    raw_wrapper_variants,
+                    response_wrapper_tag or ''
+                )
+            else:
+                response_wrapper_tag_variants = None
+
             custom_prompts = {
                 'ollama': session_data.get('custom_ollama_prompt'),
                 'system': session_data.get('custom_system_prompt'),
                 'assistant': session_data.get('custom_assistant_prompt'),
-                'user': session_data.get('custom_user_prompt')
+                'batch_assistant': session_data.get('custom_batch_assistant_prompt'),
+                'user': session_data.get('custom_user_prompt'),
+                'json_payload': session_data.get('custom_json_payload_prompt'),
+                'batch_json_payload': session_data.get('custom_batch_json_payload_prompt'),
+                'batch_hint': session_data.get('custom_batch_hint_prompt'),
             }
 
             if 'context_size' in session_data and 'context_before' not in session_data:
@@ -151,10 +255,26 @@ class SessionManager:
                 context_before = session_data.get('context_before', 3)
                 context_after = session_data.get('context_after', 2)
 
+            paragraphs = session_data['paragraphs']
+            _TRANSIENT_FIELDS = (
+                '_had_newlines',
+                '_original_parts',
+                '_original_separators',
+                '_used_ps_marker',
+                'use_ps_markers',
+                'index',
+                'llm_prompt',
+            )
+            for para in paragraphs:
+                for field in _TRANSIENT_FIELDS:
+                    para.pop(field, None)
+
             result = {
+                'session_version': session_data.get('session_version', 1),
                 'original_file_path': session_data['original_file_path'],
                 'file_type': session_data['file_type'],
-                'paragraphs': session_data['paragraphs'],
+                'source_format': session_data.get('source_format', ''),
+                'paragraphs': paragraphs,
                 'context_before': context_before,
                 'context_after': context_after,
                 'temperature': session_data.get('temperature', 0.8),
@@ -162,6 +282,8 @@ class SessionManager:
                 'single_prompt_mode': session_data.get('single_prompt_mode', False),
                 'json_payload_mode': session_data.get('json_payload_mode', False),
                 'json_payload_template': session_data.get('json_payload_template', ''),
+                'batch_json_payload_template': session_data.get('batch_json_payload_template', ''),
+                'json_payload_batch': session_data.get('json_payload_batch', False),
                 'json_response_field': session_data.get('json_response_field', ''),
                 'sentence_batch_enabled': session_data.get('sentence_batch_enabled', False),
                 'sentence_batch_size': session_data.get('sentence_batch_size', 5),
@@ -177,7 +299,10 @@ class SessionManager:
                 'metadata': {
                     'processing_mode': processing_mode,
                     'prompt_variant': prompt_variant,
-                    'skip_inline_tags': skip_inline_tags
+                    'skip_inline_tags': skip_inline_tags,
+                    'tag_profile': tag_profile,
+                    'response_wrapper_tag': response_wrapper_tag,
+                    'response_wrapper_tag_variants': response_wrapper_tag_variants,
                 }
             }
 
@@ -252,12 +377,18 @@ class TagProfile:
         non_trans_prefix: str = "nt_",
         paragraph_separator: str = "ps",
         batch_separator: str = "z",
+        core_text_var: str = "core_text",
+        context_before_var: str = "context_before",
+        context_after_var: str = "context_after",
     ):
         self.reserve_prefix = reserve_prefix
         self.inline_prefix = inline_prefix
         self.non_trans_prefix = non_trans_prefix
         self.paragraph_separator = paragraph_separator
         self.batch_separator = batch_separator
+        self.core_text_var = core_text_var
+        self.context_before_var = context_before_var
+        self.context_after_var = context_after_var
 
     @staticmethod
     def from_settings(settings_dict: Optional[Dict]) -> "TagProfile":
@@ -278,6 +409,9 @@ class TagProfile:
             non_trans_prefix=pick("non_trans_prefix", defaults.non_trans_prefix),
             paragraph_separator=pick("paragraph_separator", defaults.paragraph_separator),
             batch_separator=pick("batch_separator", defaults.batch_separator),
+            core_text_var=pick("core_text_var", defaults.core_text_var),
+            context_before_var=pick("context_before_var", defaults.context_before_var),
+            context_after_var=pick("context_after_var", defaults.context_after_var),
         )
 
     def reserve_open_re(self) -> re.Pattern:
@@ -327,15 +461,32 @@ class TagProfile:
     def non_trans_placeholder(self, n: int) -> str:
         return f'<{self.non_trans_prefix}{n:02d}/>'
 
+    def fill_template(
+        self,
+        template: str,
+        core_text: str,
+        context_before: str,
+        context_after: str,
+    ) -> str:
+        mapping = {
+            self.core_text_var: core_text,
+            self.context_before_var: context_before,
+            self.context_after_var: context_after,
+        }
+        pattern = re.compile(
+            r'\{(' + '|'.join(re.escape(name) for name in mapping) + r')\}'
+        )
+        return pattern.sub(lambda m: mapping[m.group(1)], template)
+
 class AppSettingsManager:
     SETTINGS_FILE = "app_settings.json"
 
     DEFAULT_SETTINGS = {
         "llm_choice": "LM Studio",
-        "server_url": "",
+        "server_url": "http://localhost:1234/v1/chat/completions",
         "json_response_field": "",
         "ollama_model_name": "",
-        "ollama_server_url": "",
+        "ollama_server_url": "http://localhost:11434",
         "openrouter_api_key": "",
         "openrouter_model_name": "",
         "ollama_endpoint": "http://localhost:11434",
@@ -346,9 +497,11 @@ class AppSettingsManager:
         "show_ps_in_ui": False,
         "quote_style": "neutral",
         "skip_inline_tags": {},
-        "auto_save_interval": 1,
+        "auto_save_interval": 10,
         "enable_thinking": False,
         "response_wrapper_tag": "translated",
+        "response_wrapper_tag_variants": [],
+        "prompt_tag_profile": None,
         "mismatch_checks": {
             "paragraphs": True,
             "first_char": True,
@@ -370,7 +523,7 @@ class AppSettingsManager:
         },
         "alignment_settings": {
             "device": "cpu",
-            "model_name": "xlm-roberta-large",
+            "model_name": "microsoft/xlm-align-base",
         },
         "tag_profile": {
             "reserve_prefix": "id_",
@@ -378,6 +531,9 @@ class AppSettingsManager:
             "non_trans_prefix": "nt_",
             "paragraph_separator": "ps",
             "batch_separator": "z",
+            "core_text_var": "core_text",
+            "context_before_var": "context_before",
+            "context_after_var": "context_after",
         },
     }
 
@@ -396,6 +552,11 @@ class AppSettingsManager:
 
         for key, val in AppSettingsManager.DEFAULT_SETTINGS.items():
             settings.setdefault(key, val)
+
+        settings['response_wrapper_tag_variants'] = normalize_wrapper_variants(
+            settings.get('response_wrapper_tag_variants'),
+            settings.get('response_wrapper_tag') or 'translated'
+        )
 
         if 'use_ps_markers' in settings:
             if 'restore_paragraph_structure' not in settings:
@@ -453,6 +614,11 @@ class AppSettingsManager:
             else:
                 validated_settings[key] = settings.get(key, default_val)
 
+        validated_settings['response_wrapper_tag_variants'] = normalize_wrapper_variants(
+            settings.get('response_wrapper_tag_variants'),
+            validated_settings.get('response_wrapper_tag') or 'translated'
+        )
+
         for obsolete in ('use_ps_markers', 'restore_paragraph_epub', 'restore_paragraph_txt'):
             validated_settings.pop(obsolete, None)
 
@@ -475,15 +641,23 @@ class AppSettingsManager:
         if llm_choice == 'Ollama':
             model_name = settings.get('ollama_model_name', '')
             api_key = None
-            endpoint = settings.get('ollama_endpoint', 'http://localhost:11434')
+            endpoint = (
+                settings.get('ollama_endpoint', '').strip()
+                or 'http://localhost:11434'
+            )
+
         elif llm_choice == 'Openrouter':
             model_name = settings.get('openrouter_model_name', '')
             api_key = settings.get('openrouter_api_key', '')
             endpoint = 'https://openrouter.ai/api/v1'
+
         else:
             model_name = 'local-model'
             api_key = None
-            endpoint = settings.get('server_url', 'http://localhost:1234/v1') or 'http://localhost:1234/v1'
+            endpoint = (
+                settings.get('server_url', '').strip()
+                or 'http://localhost:1234/v1/chat/completions'
+            )
 
         return {
             'llm_choice': llm_choice,
@@ -493,6 +667,191 @@ class AppSettingsManager:
         }
 
 class PromptManager:
+    PROMPT_VARIANTS = ("txt", "srt", "epub_legacy", "epub_inline")
+    PROMPT_ROLES = (
+        "system",
+        "assistant",
+        "batch_assistant",
+        "user",
+        "ollama",
+        "json_payload",
+        "batch_json_payload",
+        "batch_hint",
+    )
+    DEFAULT_PROMPT_PROFILE = {
+        "reserve_prefix": "id_",
+        "inline_prefix": "p_",
+        "non_trans_prefix": "nt_",
+        "paragraph_separator": "ps",
+        "batch_separator": "z",
+        "core_text_var": "core_text",
+        "context_before_var": "context_before",
+        "context_after_var": "context_after",
+        "response_wrapper_tag": "translated",
+    }
+    _active_profile = dict(DEFAULT_PROMPT_PROFILE)
+
+    @staticmethod
+    def normalize_prompt_profile(profile: Optional[Dict]) -> Dict[str, str]:
+        result = dict(PromptManager.DEFAULT_PROMPT_PROFILE)
+        if isinstance(profile, dict):
+            for key in result:
+                value = profile.get(key)
+                if isinstance(value, str) and value.strip():
+                    result[key] = value.strip()
+        return result
+
+    @staticmethod
+    def profile_from_settings(settings: Optional[Dict]) -> Dict[str, str]:
+        flat = {}
+        if isinstance(settings, dict):
+            tag_profile = settings.get("tag_profile")
+            if isinstance(tag_profile, dict):
+                flat.update(tag_profile)
+            flat["response_wrapper_tag"] = settings.get("response_wrapper_tag")
+        return PromptManager.normalize_prompt_profile(flat)
+
+    @staticmethod
+    def resolve_prompt_profile(settings: Optional[Dict]) -> Dict[str, str]:
+        if isinstance(settings, dict):
+            saved = settings.get("prompt_tag_profile")
+            if isinstance(saved, dict) and saved:
+                return PromptManager.normalize_prompt_profile(saved)
+        return PromptManager.profile_from_settings(settings)
+
+    @staticmethod
+    def set_active_profile(profile: Optional[Dict]) -> None:
+        PromptManager._active_profile = PromptManager.normalize_prompt_profile(profile)
+
+    @staticmethod
+    def convert_prompt_text(text: str, from_profile: Dict, to_profile: Dict) -> str:
+        if not isinstance(text, str) or not text:
+            return text
+
+        src = PromptManager.normalize_prompt_profile(from_profile)
+        dst = PromptManager.normalize_prompt_profile(to_profile)
+        if src == dst:
+            return text
+
+        esc = re.escape
+        number = r'(?:\d{2}|XX|NN)'
+        parts = [
+            r'(?P<batch><' + esc(src["batch_separator"]) + r'>)',
+            r'(?P<para><(?P<para_slash>/?)' + esc(src["paragraph_separator"]) + r'>)',
+            r'(?P<wrap><(?P<wrap_slash>/?)' + esc(src["response_wrapper_tag"]) + r'>)',
+            r'(?P<nt><' + esc(src["non_trans_prefix"]) + r'(?P<nt_num>' + number + r')/>)',
+            r'(?P<res><(?P<res_slash>/?)' + esc(src["reserve_prefix"]) + r'(?P<res_num>' + number + r')>)',
+            r'(?P<inl><(?P<inl_slash>/?)' + esc(src["inline_prefix"]) + r'(?P<inl_num>' + number + r')>)',
+            r'(?P<core>\{' + esc(src["core_text_var"]) + r'\})',
+            r'(?P<before>\{' + esc(src["context_before_var"]) + r'\})',
+            r'(?P<after>\{' + esc(src["context_after_var"]) + r'\})',
+        ]
+        pattern = re.compile('|'.join(parts))
+
+        def replace(match):
+            if match.group('batch') is not None:
+                return '<' + dst["batch_separator"] + '>'
+            if match.group('para') is not None:
+                return '<' + match.group('para_slash') + dst["paragraph_separator"] + '>'
+            if match.group('wrap') is not None:
+                return '<' + match.group('wrap_slash') + dst["response_wrapper_tag"] + '>'
+            if match.group('nt') is not None:
+                return '<' + dst["non_trans_prefix"] + match.group('nt_num') + '/>'
+            if match.group('res') is not None:
+                return '<' + match.group('res_slash') + dst["reserve_prefix"] + match.group('res_num') + '>'
+            if match.group('inl') is not None:
+                return '<' + match.group('inl_slash') + dst["inline_prefix"] + match.group('inl_num') + '>'
+            if match.group('core') is not None:
+                return '{' + dst["core_text_var"] + '}'
+            if match.group('before') is not None:
+                return '{' + dst["context_before_var"] + '}'
+            return '{' + dst["context_after_var"] + '}'
+
+        return pattern.sub(replace, text)
+
+    @staticmethod
+    def adapt_default_text(text: str) -> str:
+        return PromptManager.convert_prompt_text(
+            text,
+            PromptManager.DEFAULT_PROMPT_PROFILE,
+            PromptManager._active_profile
+        )
+
+    @staticmethod
+    def convert_prompt_cache(cache: Dict, from_profile: Dict, to_profile: Dict) -> Dict:
+        converted = {}
+        for variant, prompts in (cache or {}).items():
+            if not isinstance(prompts, dict):
+                converted[variant] = prompts
+                continue
+            converted[variant] = {}
+            for role, text in prompts.items():
+                converted[variant][role] = PromptManager.convert_prompt_text(
+                    text, from_profile, to_profile
+                )
+        return converted
+
+    @staticmethod
+    def migrate_prompt_files(from_profile: Dict, to_profile: Dict) -> List[str]:
+        src = PromptManager.normalize_prompt_profile(from_profile)
+        dst = PromptManager.normalize_prompt_profile(to_profile)
+        if src == dst:
+            return []
+
+        pending = []
+        for variant in PromptManager.PROMPT_VARIANTS:
+            for role in PromptManager.PROMPT_ROLES:
+                filename = f"llm_prompt_{role}_{variant}.txt"
+                if not os.path.exists(filename):
+                    continue
+                with open(filename, 'r', encoding='utf-8') as f:
+                    original = f.read()
+                converted = PromptManager.convert_prompt_text(original, src, dst)
+                if converted != original:
+                    pending.append((filename, original, converted))
+
+        if not pending:
+            return []
+
+        temp_files = []
+        try:
+            for filename, _original, converted in pending:
+                temp_path = filename + ".tmp"
+                temp_files.append(temp_path)
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    f.write(converted)
+        except Exception:
+            for temp_path in temp_files:
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+            raise
+
+        replaced = []
+        try:
+            for (filename, original, _converted), temp_path in zip(pending, temp_files):
+                os.replace(temp_path, filename)
+                replaced.append((filename, original))
+                logger.info(f"Prompt tags renamed in: {filename}")
+        except Exception:
+            for filename, original in replaced:
+                try:
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write(original)
+                except Exception as restore_error:
+                    logger.error(f"Failed to restore {filename}: {restore_error}")
+            for temp_path in temp_files:
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+            raise
+
+        return [filename for filename, _original, _converted in pending]
+    
     @staticmethod
     def get_prompt(variant: str, role: str) -> str:
         filename = f"llm_prompt_{role}_{variant}.txt"
@@ -1001,6 +1360,27 @@ Return format:
                 logger.error(f"Failed to delete {filename}: {e}")
 
         return deleted_count
+
+def _adapt_default_prompt(original):
+    @_functools.wraps(original)
+    def wrapper(*args, **kwargs):
+        return PromptManager.adapt_default_text(original(*args, **kwargs))
+    return wrapper
+
+
+for _method_name in (
+    'get_default_system_prompt',
+    'get_default_assistant_prompt',
+    'get_default_user_prompt',
+    'get_default_json_payload_prompt',
+    'get_default_batch_json_payload_prompt',
+    'get_default_batch_hint_prompt',
+):
+    setattr(
+        PromptManager,
+        _method_name,
+        staticmethod(_adapt_default_prompt(getattr(PromptManager, _method_name)))
+    )
 
 class EPUBConstants:
     PRIORITY_TAGS = ['p', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote']
