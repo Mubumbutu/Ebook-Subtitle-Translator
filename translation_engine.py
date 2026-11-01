@@ -8,7 +8,7 @@ import threading
 from abc import ABC, abstractmethod
 from openrouter import OpenRouter
 from typing import Dict, List, Optional, Tuple, Union
-from app_utils import TagProfile
+from app_utils import TagProfile, build_wrapper_tags_pattern, normalize_wrapper_variants
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,85 @@ class SentenceBatcher:
             f"==================================="
         )
 
+def is_json_payload_prompt(prompt) -> bool:
+    return isinstance(prompt, dict) and "__json_payload__" in prompt
+
+
+def extract_json_response_field(data, field: str) -> str:
+    def walk(node, path):
+        for part in path.split('.'):
+            if isinstance(node, str):
+                node = json.loads(node)
+            if isinstance(node, list):
+                node = node[int(part)]
+            elif isinstance(node, dict):
+                node = node[part]
+            else:
+                raise KeyError(part)
+        return node
+
+    def to_text(value):
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+
+    field = (field or "").strip()
+    if field:
+        try:
+            return to_text(walk(data, field))
+        except (KeyError, IndexError, ValueError, TypeError) as e:
+            raise ValueError(f"Response field '{field}' not found in server response: {e}")
+
+    for key in ("translation", "Translation", "text", "result", "output", "translated"):
+        if isinstance(data, dict) and isinstance(data.get(key), str):
+            return data[key]
+
+    for path in ("choices.0.message.content", "message.content"):
+        try:
+            value = walk(data, path)
+        except (KeyError, IndexError, ValueError, TypeError):
+            continue
+        if isinstance(value, str):
+            return value
+
+    raise ValueError(
+        "Could not auto-detect the translation in the server response. "
+        "Set the 'Response field' option."
+    )
+
+def compose_json_raw_response(data, content: str) -> str:
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return content
+    if not isinstance(data, dict):
+        return content
+
+    candidates = []
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        choice_message = choices[0].get("message")
+        if isinstance(choice_message, dict):
+            candidates.append(choice_message)
+    top_message = data.get("message")
+    if isinstance(top_message, dict):
+        candidates.append(top_message)
+    candidates.append(data)
+
+    reasoning = ""
+    for node in candidates:
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                reasoning = value.strip()
+                break
+        if reasoning:
+            break
+
+    if reasoning:
+        return f"<thinking>\n{reasoning}\n</thinking>\n\n{content}"
+    return content
 
 class LLMClient(ABC):
     @abstractmethod
@@ -249,6 +328,71 @@ class LMStudioClient(LLMClient):
             full = content
         return content, full
 
+    def _translate_json_payload(
+        self,
+        prompt: Dict,
+        temperature: float,
+        timeout_seconds: int,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None
+    ) -> str:
+        payload = dict(prompt["__json_payload__"])
+        response_field = prompt.get("__response_field__", "")
+        payload.setdefault("model", "local-model")
+        payload["temperature"] = temperature
+        payload["stream"] = False
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if top_k is not None:
+            payload["top_k"] = top_k
+        if not self.enable_thinking:
+            payload.setdefault("reasoning_effort", "none")
+
+        headers = {"Content-Type": "application/json"}
+
+        session = requests.Session()
+        with self._session_lock:
+            self._active_session = session
+            self._abort_event.clear()
+
+        try:
+            logger.debug(
+                f"LM Studio JSON payload request: endpoint={self.endpoint}, "
+                f"temp={temperature}, timeout={timeout_seconds}s, "
+                f"thinking={self.enable_thinking}"
+            )
+            response = session.post(
+                self.endpoint,
+                json=payload,
+                headers=headers,
+                timeout=timeout_seconds
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = extract_json_response_field(data, response_field)
+            self.last_raw_response = compose_json_raw_response(data, content)
+            if not content:
+                logger.warning("LM Studio returned empty response (JSON payload mode)")
+                return ""
+            logger.debug(
+                f"LM Studio JSON payload response: {len(content)} chars "
+                f"(raw: {len(self.last_raw_response)} chars)"
+            )
+            return content
+
+        except requests.Timeout:
+            logger.error(f"LM Studio timeout after {timeout_seconds}s")
+            raise TimeoutError(f"LM Studio request timed out after {timeout_seconds}s")
+
+        except requests.RequestException as e:
+            logger.error(f"LM Studio JSON payload request failed: {e}")
+            raise
+
+        finally:
+            with self._session_lock:
+                if self._active_session is session:
+                    self._active_session = None
+
     def translate(
         self,
         prompt: Union[str, List[Dict]],
@@ -258,6 +402,11 @@ class LMStudioClient(LLMClient):
         top_k: Optional[int] = None
     ) -> str:
         self.last_raw_response = ""
+
+        if is_json_payload_prompt(prompt):
+            return self._translate_json_payload(
+                prompt, temperature, timeout_seconds, top_p, top_k
+            )
 
         if isinstance(prompt, list):
             messages = prompt
@@ -338,9 +487,37 @@ class OllamaClient(LLMClient):
                     logger.warning(f"OllamaClient: session close error: {e}")
                 self._active_session = None
  
+    @staticmethod
+    def _normalize_messages(messages: List[Dict]) -> List[Dict]:
+        normalized = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                normalized.append(msg)
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                normalized.append(msg)
+                continue
+            new_msg = dict(msg)
+            if isinstance(content, list):
+                all_text_parts = bool(content) and all(
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                    for part in content
+                )
+                if all_text_parts:
+                    new_msg["content"] = "\n".join(part["text"] for part in content)
+                else:
+                    new_msg["content"] = json.dumps(content, ensure_ascii=False)
+            else:
+                new_msg["content"] = json.dumps(content, ensure_ascii=False)
+            normalized.append(new_msg)
+        return normalized
+
     def translate(
         self,
-        prompt: str,
+        prompt: Union[str, List[Dict], Dict],
         temperature: float,
         timeout_seconds: int,
         top_p: Optional[float] = None,
@@ -348,7 +525,15 @@ class OllamaClient(LLMClient):
     ) -> str:
         self.last_raw_response = ""
 
-        if isinstance(prompt, list):
+        json_mode = is_json_payload_prompt(prompt)
+        response_field = ""
+
+        if json_mode:
+            messages = self._normalize_messages(
+                prompt["__json_payload__"].get("messages", [])
+            )
+            response_field = prompt.get("__response_field__", "")
+        elif isinstance(prompt, list):
             messages = prompt
         else:
             messages = [{"role": "user", "content": prompt}]
@@ -374,7 +559,10 @@ class OllamaClient(LLMClient):
             self._active_session = session
 
         try:
-            logger.debug(f"Ollama request: model={self.model_name}, temp={temperature}, timeout={timeout_seconds}s, thinking={self.enable_thinking}")
+            logger.debug(
+                f"Ollama request: model={self.model_name}, temp={temperature}, "
+                f"timeout={timeout_seconds}s, thinking={self.enable_thinking}, json_payload={json_mode}"
+            )
             response = session.post(
                 self.api_url,
                 json=payload,
@@ -383,6 +571,19 @@ class OllamaClient(LLMClient):
             )
             response.raise_for_status()
             data = response.json()
+
+            if json_mode:
+                content = extract_json_response_field(data, response_field)
+                self.last_raw_response = compose_json_raw_response(data, content)
+                if not content:
+                    logger.warning("Ollama returned empty response (JSON payload mode)")
+                    return ""
+                logger.debug(
+                    f"Ollama JSON payload response: {len(content)} chars "
+                    f"(raw: {len(self.last_raw_response)} chars)"
+                )
+                return content
+
             message = data.get("message", {}) or {}
             content = message.get("content", "") or ""
             thinking = message.get("thinking", "") or ""
@@ -463,7 +664,7 @@ class OpenRouterClient(LLMClient):
 
     def translate(
         self,
-        prompt: List[Dict],
+        prompt: Union[List[Dict], Dict],
         temperature: float,
         timeout_seconds: int,
         top_p: Optional[float] = None,
@@ -471,6 +672,10 @@ class OpenRouterClient(LLMClient):
         max_retries: int = 5
     ) -> str:
         self.last_raw_response = ""
+
+        json_mode = is_json_payload_prompt(prompt)
+        if json_mode:
+            prompt = prompt["__json_payload__"].get("messages", [])
 
         for attempt in range(1, max_retries + 1):
             self._wait_for_rate_limit()
@@ -482,7 +687,7 @@ class OpenRouterClient(LLMClient):
                     f"OpenRouter SDK request (attempt {attempt}/{max_retries}): "
                     f"model={self.model_name}, temp={temperature}, "
                     f"timeout={timeout_seconds}s, free={self.is_free_model}, "
-                    f"reasoning={self.enable_thinking}"
+                    f"reasoning={self.enable_thinking}, json_payload={json_mode}"
                 )
 
                 extra_params = {}
@@ -650,7 +855,8 @@ class PromptBuilder:
         ollama_template: Optional[str] = None,
         single_prompt_mode: bool = False,
         json_payload_template: Optional[str] = None,
-        json_response_field: str = ""
+        json_response_field: str = "",
+        tag_profile: Optional[TagProfile] = None
     ):
         self.variant = variant
         self.system_template = system_template
@@ -660,6 +866,7 @@ class PromptBuilder:
         self.single_prompt_mode = single_prompt_mode
         self.json_payload_template = json_payload_template
         self.json_response_field = json_response_field
+        self.tag_profile = tag_profile or TagProfile()
 
         logger.info(f"PromptBuilder initialized: variant={variant}, single_prompt={single_prompt_mode}, json_payload={bool(json_payload_template)}")
 
@@ -670,7 +877,7 @@ class PromptBuilder:
         context_after: str = "",
         auto_fix_section: str = ""
     ) -> Union[str, List[Dict]]:
- 
+
         batch_hint = ""
         try:
             if hasattr(self, '_pending_batch_hint'):
@@ -678,22 +885,14 @@ class PromptBuilder:
         finally:
             if hasattr(self, '_pending_batch_hint'):
                 delattr(self, '_pending_batch_hint')
- 
+
+        fill = self.tag_profile.fill_template
+
         if self.json_payload_template is not None:
-            filled_content = (
-                self.json_payload_template
-                .replace("{core_text}", core_text)
-                .replace("{context_before}", context_before)
-                .replace("{context_after}", context_after)
-            )
- 
-            if batch_hint:
-                filled_content = batch_hint + "\n\n" + filled_content
- 
+            auto_fix_block = ""
             if auto_fix_section and auto_fix_section.strip():
-                filled_content = (
-                    filled_content.rstrip()
-                    + "\n\n"
+                auto_fix_block = (
+                    "\n\n"
                     "=== AUTO-FIX INSTRUCTIONS - CRITICAL ===\n"
                     "You MUST fix the following issues in your previous translation:\n\n"
                     + auto_fix_section.strip()
@@ -701,22 +900,82 @@ class PromptBuilder:
                     "=== END OF AUTO-FIX INSTRUCTIONS ===\n"
                     "Return ONLY the corrected translation in the same JSON format as before."
                 )
- 
-            content_value: object = filled_content
-            stripped = filled_content.strip()
-            if stripped.startswith(("[", "{")):
+
+            content_value: object = None
+            template_stripped = self.json_payload_template.strip()
+
+            if template_stripped.startswith(("[", "{")):
                 try:
-                    parsed = json.loads(stripped)
-                    if isinstance(parsed, (list, dict)):
-                        content_value = parsed
-                        logger.debug(
-                            f"JSON Payload: content parsed as "
-                            f"{'list' if isinstance(parsed, list) else 'dict'} "
-                            f"({len(parsed) if isinstance(parsed, list) else len(parsed.keys())} items)"
-                        )
+                    parsed_template = json.loads(template_stripped)
                 except json.JSONDecodeError:
-                    pass
- 
+                    parsed_template = None
+
+                if isinstance(parsed_template, (list, dict)):
+                    core_marker = "{" + self.tag_profile.core_text_var + "}"
+
+                    def contains_marker(node):
+                        if isinstance(node, str):
+                            return core_marker in node
+                        if isinstance(node, list):
+                            return any(contains_marker(item) for item in node)
+                        if isinstance(node, dict):
+                            return any(contains_marker(value) for value in node.values())
+                        return False
+
+                    if contains_marker(parsed_template):
+                        state = {"extras_applied": False}
+
+                        def fill_node(node):
+                            if isinstance(node, str):
+                                result = fill(node, core_text, context_before, context_after)
+                                if not state["extras_applied"] and core_marker in node:
+                                    state["extras_applied"] = True
+                                    if batch_hint:
+                                        result = batch_hint + "\n\n" + result
+                                    if auto_fix_block:
+                                        result = result.rstrip() + auto_fix_block
+                                return result
+                            if isinstance(node, list):
+                                return [fill_node(item) for item in node]
+                            if isinstance(node, dict):
+                                return {key: fill_node(value) for key, value in node.items()}
+                            return node
+
+                        content_value = fill_node(parsed_template)
+                        logger.debug(
+                            f"JSON Payload: template parsed first, variables substituted inside strings "
+                            f"({'list' if isinstance(content_value, list) else 'dict'})"
+                        )
+
+            if content_value is None:
+                filled_content = fill(
+                    self.json_payload_template,
+                    core_text,
+                    context_before,
+                    context_after
+                )
+
+                if batch_hint:
+                    filled_content = batch_hint + "\n\n" + filled_content
+
+                if auto_fix_block:
+                    filled_content = filled_content.rstrip() + auto_fix_block
+
+                content_value = filled_content
+                stripped = filled_content.strip()
+                if stripped.startswith(("[", "{")):
+                    try:
+                        parsed = json.loads(stripped)
+                        if isinstance(parsed, (list, dict)):
+                            content_value = parsed
+                            logger.debug(
+                                f"JSON Payload: content parsed as "
+                                f"{'list' if isinstance(parsed, list) else 'dict'} "
+                                f"({len(parsed) if isinstance(parsed, list) else len(parsed.keys())} items)"
+                            )
+                    except json.JSONDecodeError:
+                        pass
+
             payload_dict = {
                 "messages": [
                     {
@@ -725,50 +984,54 @@ class PromptBuilder:
                     }
                 ]
             }
- 
+
             return {
                 "__json_payload__": payload_dict,
                 "__response_field__": self.json_response_field
             }
- 
+
         if self.ollama_template is not None:
-            prompt = self.ollama_template.format(
-                core_text=core_text,
-                context_before=context_before,
-                context_after=context_after
+            prompt = fill(
+                self.ollama_template,
+                core_text,
+                context_before,
+                context_after
             )
             if batch_hint:
                 prompt = prompt + "\n\n" + batch_hint
             if auto_fix_section:
                 prompt += "\n\n" + auto_fix_section
             return prompt
- 
-        system_content = self.system_template.format(
-            core_text=core_text,
-            context_before=context_before,
-            context_after=context_after
+
+        system_content = fill(
+            self.system_template,
+            core_text,
+            context_before,
+            context_after
         ) if self.system_template else ""
- 
-        assistant_content = self.assistant_template.format(
-            core_text=core_text,
-            context_before=context_before,
-            context_after=context_after
+
+        assistant_content = fill(
+            self.assistant_template,
+            core_text,
+            context_before,
+            context_after
         ) if self.assistant_template else ""
- 
-        user_content = self.user_template.format(
-            core_text=core_text,
-            context_before=context_before,
-            context_after=context_after
+
+        user_content = fill(
+            self.user_template,
+            core_text,
+            context_before,
+            context_after
         ) if self.user_template else ""
- 
+
         if batch_hint:
             if system_content:
                 system_content = system_content + "\n\n" + batch_hint
             user_content = user_content + "\n\n" + batch_hint
- 
+
         if auto_fix_section:
             user_content += "\n\n" + auto_fix_section
- 
+
         if self.single_prompt_mode:
             merged = ""
             if system_content:
@@ -813,7 +1076,8 @@ class AutoFixManager:
         self,
         translation: str,
         mismatch_flags: Dict,
-        raw_response: Optional[str] = None
+        raw_response: Optional[str] = None,
+        prompt=None
     ) -> None:
         error_count = sum(1 for v in mismatch_flags.values() if v)
 
@@ -821,6 +1085,7 @@ class AutoFixManager:
             'attempt': len(self.history) + 1,
             'translation': translation,
             'raw_response': raw_response,
+            'prompt': prompt,
             'mismatch_flags': mismatch_flags.copy(),
             'error_count': error_count,
             'temperature': self.current_temperature
@@ -1224,20 +1489,31 @@ class TranslationOrchestrator:
         timeout_minutes: int = 10,
         response_wrapper_tag: str = "translated",
         tag_profile: Optional[TagProfile] = None,
-        split_fn: Optional[callable] = None
+        split_fn: Optional[callable] = None,
+        response_wrapper_tag_variants: Optional[List[str]] = None
     ):
         self.llm_client = llm_client
         self.prompt_builder = prompt_builder
         self.formatting_sync = formatting_sync
         self.timeout_seconds = timeout_minutes * 60
         self.response_wrapper_tag = (response_wrapper_tag or "translated").strip() or "translated"
+        self.response_wrapper_tag_variants = normalize_wrapper_variants(
+            response_wrapper_tag_variants,
+            self.response_wrapper_tag
+        )
         self.tag_profile = tag_profile or TagProfile()
         self.split_fn = split_fn
         self._cancelled = False
 
         logger.info(
             f"TranslationOrchestrator initialized: timeout={timeout_minutes}min, "
-            f"wrapper={self.response_wrapper_tag}, split_fn={'YES' if split_fn else 'NO'}"
+            f"wrapper={self.response_wrapper_tag}, variants={self.response_wrapper_tag_variants}, split_fn={'YES' if split_fn else 'NO'}"
+        )
+
+    def get_wrapper_tags_pattern(self) -> str:
+        return build_wrapper_tags_pattern(
+            self.response_wrapper_tag,
+            self.response_wrapper_tag_variants
         )
 
     def cancel(self):
@@ -1568,6 +1844,7 @@ class TranslationOrchestrator:
                 context_after_str,
                 auto_fix_section
             )
+            fragment['llm_prompt'] = prompt
 
             attempt_num = auto_fix_manager.get_current_attempt_number() if auto_fix_manager else 1
 
@@ -1670,7 +1947,12 @@ class TranslationOrchestrator:
                 fragment['is_translated'] = True
 
                 has_mismatch, mismatch_flags = mismatch_checker.check_mismatch(fragment)
-                auto_fix_manager.record_attempt(cleaned, mismatch_flags, raw_response=raw_response)
+                auto_fix_manager.record_attempt(
+                    cleaned,
+                    mismatch_flags,
+                    raw_response=raw_response,
+                    prompt=prompt
+                )
 
                 if has_mismatch:
                     error_count = sum(1 for v in mismatch_flags.values() if v)
@@ -1712,6 +1994,7 @@ class TranslationOrchestrator:
                         logger.warning("=" * 80)
                         logger.warning("")
                         fragment['llm_raw_response'] = auto_fix_manager.best_attempt.get('raw_response') or raw_response
+                        fragment['llm_prompt'] = auto_fix_manager.best_attempt.get('prompt') or prompt
                         return best
                     else:
                         logger.warning(f"⚠ Auto-fix FAILED - returning last attempt")
@@ -1736,11 +2019,7 @@ class TranslationOrchestrator:
     def _extract_translation_from_response(self, response: str) -> str:
         text = response.strip()
 
-        custom_tag = self.response_wrapper_tag
-        if custom_tag and custom_tag.lower() not in ('translated', 'translation'):
-            tags_pattern = f'(?:{re.escape(custom_tag)}|translated|translation)'
-        else:
-            tags_pattern = r'(?:translated|translation)'
+        tags_pattern = self.get_wrapper_tags_pattern()
 
         matches = re.findall(
             rf'<{tags_pattern}>(.*?)</{tags_pattern}>',
@@ -1749,9 +2028,49 @@ class TranslationOrchestrator:
         )
 
         if matches:
-            best = max(matches, key=len)
-            text = best.strip()
-            logger.debug(f"Extracted text from <{tags_pattern}> tags")
+            PROMPT_MARKERS = (
+                '<context_before>',
+                '<context_after>',
+                '<text_to_translate>',
+                '<translated>',
+                '</translated>',
+                '<translation>',
+                '</translation>',
+            )
+
+            candidates = []
+            for m in matches:
+                stripped = m.strip()
+                if not stripped:
+                    continue
+                if any(marker in stripped for marker in PROMPT_MARKERS):
+                    continue
+                if not any(ch.isalpha() or ch.isdigit() for ch in stripped):
+                    continue
+                candidates.append(stripped)
+
+            if candidates:
+                best = max(candidates, key=len)
+                text = best
+                logger.debug(f"Extracted {len(text)} chars from <{tags_pattern}> tags")
+            else:
+                logger.warning(
+                    "All wrapper-tag matches look like prompt echo or punctuation only "
+                    "- returning empty translation"
+                )
+                text = ""
+        else:
+            PROMPT_ECHO_MARKERS = (
+                '<context_before>',
+                '<context_after>',
+                '<text_to_translate>',
+            )
+            if any(marker in text for marker in PROMPT_ECHO_MARKERS):
+                logger.error(
+                    "LLM echoed the prompt back instead of translating "
+                    "- no wrapper tags found"
+                )
+                return ""
 
         if '\\n' in text:
             text = text.replace('\\n', '\n')
