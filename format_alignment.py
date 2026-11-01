@@ -4,12 +4,14 @@ import gc
 import logging
 import os
 import re
+import time
 import torch
 import torch.nn.functional as F
 from collections import Counter
+from dataclasses import dataclass, replace
 from lxml import etree
 from transformers import AutoModel, AutoTokenizer
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,8 @@ RESERVE_TAGS = {
     'abbr', 'wbr', 'var', 'canvas', 'svg', 'script',
     'style', 'math', 'a'
 }
+EXTENDED_TRANSFER_TAGS = INLINE_TRANSFER_TAGS | {'a', 'sub', 'sup', 'code'}
+EXTENDED_RESERVE_TAGS = RESERVE_TAGS - {'a', 'sub', 'sup', 'code'}
 XHTML_NS = 'http://www.w3.org/1999/xhtml'
 MODELS_SUBDIR = 'models'
 
@@ -32,6 +36,385 @@ _RE_ABBREV       = re.compile(r'^[A-Za-z]{1,3}\.$|^\d+\.$')
 _RE_ELLIPSIS     = re.compile(r'\.\.\.$')
 _RE_CONTENT_WORD = re.compile(r'\w', re.UNICODE)
 _HYPHEN_JOINERS  = frozenset({'-', '\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2015'})
+ALIGNMENT_MAX_LENGTH = 512
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    model_id: str
+    align_layers: Optional[Tuple[int, ...]] = None
+    pooling: str = 'mean'
+    word_id_source: str = 'auto'
+
+    def __post_init__(self) -> None:
+        if self.pooling not in ('mean', 'first'):
+            raise ValueError(
+                f"Unsupported pooling '{self.pooling}' for model '{self.model_id}'. "
+                f"Use 'mean' or 'first'."
+            )
+        if self.word_id_source not in ('auto', 'legacy'):
+            raise ValueError(
+                f"Unsupported word_id_source '{self.word_id_source}' for model "
+                f"'{self.model_id}'. Use 'auto' or 'legacy'."
+            )
+
+
+AVAILABLE_MODELS: Dict[str, ModelSpec] = {
+    'xlm-roberta-large': ModelSpec(
+        model_id='xlm-roberta-large',
+        word_id_source='legacy',
+    ),
+    'FacebookAI/xlm-roberta-base': ModelSpec(model_id='FacebookAI/xlm-roberta-base'),
+    'microsoft/xlm-align-base': ModelSpec(model_id='microsoft/xlm-align-base'),
+    'microsoft/infoxlm-base': ModelSpec(model_id='microsoft/infoxlm-base'),
+    'microsoft/infoxlm-large': ModelSpec(model_id='microsoft/infoxlm-large'),
+    'microsoft/mdeberta-v3-base': ModelSpec(model_id='microsoft/mdeberta-v3-base'),
+}
+
+
+def resolve_model_spec(model_name: str) -> ModelSpec:
+    name = (model_name or '').strip()
+    spec = AVAILABLE_MODELS.get(name)
+    if spec is not None:
+        return spec
+    return ModelSpec(model_id=name, word_id_source='legacy')
+
+
+HF_CACHE_SUBDIR = '_hf_cache'
+
+
+def _get_hf_cache_dir(models_dir: str) -> str:
+    return os.path.join(models_dir, HF_CACHE_SUBDIR)
+
+
+def _load_tokenizer(source: str, cache_dir: Optional[str] = None):
+    errors: List[str] = []
+    for use_fast in (True, False):
+        try:
+            return AutoTokenizer.from_pretrained(
+                source,
+                use_fast=use_fast,
+                cache_dir=cache_dir,
+            )
+        except Exception as exc:
+            errors.append(f"use_fast={use_fast}: {exc}")
+    raise RuntimeError(
+        f"Could not load tokenizer from '{source}'. "
+        f"SentencePiece-based models may require the 'sentencepiece' and "
+        f"'protobuf' packages. Details: " + ' | '.join(errors)
+    )
+
+
+def _load_encoder(source: str, cache_dir: Optional[str] = None):
+    return AutoModel.from_pretrained(
+        source,
+        output_hidden_states=True,
+        ignore_mismatched_sizes=True,
+        cache_dir=cache_dir,
+    )
+
+
+@dataclass
+class WordEmbeddings:
+    words: List[str]
+    vectors: Any
+    token_word_ids: List[Optional[int]]
+    word_token_counts: Any
+
+
+class WordEmbeddingAdapter:
+    _ALIGN_LAYER_FALLBACK = 8
+
+    def __init__(
+        self,
+        model_name: str,
+        device: str = 'cpu',
+        local_models_dir: str = '',
+        spec: Optional[ModelSpec] = None,
+    ) -> None:
+        self.model_name = model_name
+        self.device = device
+        self.local_models_dir = local_models_dir
+        self.spec = spec if spec is not None else resolve_model_spec(model_name)
+        self.tokenizer = None
+        self.model = None
+        self.loaded = False
+        self.sp_model = False
+        self.align_layers: List[int] = []
+
+    def load(self) -> None:
+        os.makedirs(self.local_models_dir, exist_ok=True)
+        cache_dir = _get_hf_cache_dir(self.local_models_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        local_path = get_local_model_path(self.model_name, self.local_models_dir)
+
+        if is_model_downloaded(self.model_name, self.local_models_dir):
+            load_source = local_path
+            logger.info(f"[FormatAlignment] Loading model from local directory: {local_path}")
+        else:
+            load_source = self.spec.model_id
+            logger.info(
+                f"[FormatAlignment] Local model not found at: {local_path}\n"
+                f"[FormatAlignment] Loading from HuggingFace Hub: '{self.spec.model_id}'"
+            )
+
+        logger.info(f"[FormatAlignment] Device: {self.device}")
+        logger.info(f"[FormatAlignment] HF cache dir: {cache_dir}")
+
+        try:
+            tokenizer = _load_tokenizer(load_source, cache_dir=cache_dir)
+            model = _load_encoder(load_source, cache_dir=cache_dir)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load model '{self.model_name}' from '{load_source}': {exc}"
+            ) from exc
+
+        if load_source != local_path:
+            try:
+                os.makedirs(local_path, exist_ok=True)
+                tokenizer.save_pretrained(local_path)
+                model.save_pretrained(local_path)
+                logger.info(f"[FormatAlignment] Model saved to local directory: {local_path}")
+            except Exception as exc:
+                logger.warning(
+                    f"[FormatAlignment] Could not save model to {local_path}: {exc}"
+                )
+
+        model.eval()
+        model.to(torch.device(self.device))
+
+        self.tokenizer = tokenizer
+        self.model = model
+        self.loaded = True
+
+        self.detect_tokenizer_type()
+        self.detect_align_layers()
+
+        logger.info(
+            f"[FormatAlignment] Model '{self.model_name}' loaded successfully "
+            f"on '{self.device}'. "
+            f"Alignment layers: {self.align_layers}. "
+            f"SentencePiece: {self.sp_model}. "
+            f"Pooling: {self.spec.pooling}. "
+            f"Word id source: {self.spec.word_id_source}."
+        )
+
+    def unload(self) -> None:
+        self.model = None
+        self.tokenizer = None
+        self.loaded = False
+        self.align_layers = []
+
+    def detect_tokenizer_type(self) -> None:
+        test_tokens = self.tokenizer.tokenize("hello world")
+        self.sp_model = any(t.startswith('\u2581') for t in test_tokens)
+        logger.debug(
+            f"[FormatAlignment] Test tokens: {test_tokens} | "
+            f"SentencePiece={self.sp_model}"
+        )
+
+    def detect_align_layers(self) -> None:
+        if self.spec.align_layers:
+            self.align_layers = list(self.spec.align_layers)
+            logger.info(
+                f"[FormatAlignment] Using configured alignment layers: {self.align_layers}"
+            )
+            return
+
+        n_layers = None
+
+        try:
+            cfg = self.model.config
+            if hasattr(cfg, 'encoder_layers'):
+                n_layers = cfg.encoder_layers
+            elif hasattr(cfg, 'num_hidden_layers'):
+                n_layers = cfg.num_hidden_layers
+        except Exception as exc:
+            logger.warning(f"[FormatAlignment] Failed to read layer count from config: {exc}")
+
+        if n_layers and n_layers > 0:
+            target = max(2, round(n_layers / 3))
+            first = max(1, target - 1)
+            last = min(n_layers, target + 1)
+            self.align_layers = list(range(first, last + 1))
+        else:
+            logger.warning(
+                f"[FormatAlignment] Unknown layer count – "
+                f"using fallback layer {self._ALIGN_LAYER_FALLBACK}"
+            )
+            self.align_layers = [self._ALIGN_LAYER_FALLBACK]
+
+        logger.info(
+            f"[FormatAlignment] Detected {n_layers} layers. "
+            f"Alignment layers: {self.align_layers}"
+        )
+
+    def get_layer_output(self, outputs) -> 'torch.Tensor':
+        if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+            available = len(outputs.hidden_states)
+            layers = [l for l in self.align_layers if l < available]
+            if not layers:
+                layers = [available - 1]
+            stacked = torch.stack(
+                [outputs.hidden_states[l][0] for l in layers], dim=0
+            )
+            return stacked.mean(dim=0)
+
+        if (hasattr(outputs, 'encoder_hidden_states')
+                and outputs.encoder_hidden_states is not None):
+            available = len(outputs.encoder_hidden_states)
+            layers = [l for l in self.align_layers if l < available]
+            if not layers:
+                layers = [available - 1]
+            stacked = torch.stack(
+                [outputs.encoder_hidden_states[l][0] for l in layers], dim=0
+            )
+            return stacked.mean(dim=0)
+
+        if (hasattr(outputs, 'last_hidden_state')
+                and outputs.last_hidden_state is not None):
+            logger.debug("[FormatAlignment] Using last_hidden_state as fallback")
+            return outputs.last_hidden_state[0]
+
+        raise RuntimeError(
+            "[FormatAlignment] Model returned no hidden_states. "
+            "Make sure the model is loaded with output_hidden_states=True."
+        )
+
+    def build_word_ids(
+        self,
+        words: List[str],
+        tokens: List[str],
+    ) -> List[Optional[int]]:
+        word_ids: List[Optional[int]] = [None] * len(tokens)
+
+        try:
+            special_tokens: set = set(self.tokenizer.all_special_tokens)
+        except Exception:
+            special_tokens = {
+                '[CLS]', '[SEP]', '[PAD]', '[MASK]', '[UNK]',
+                '<s>', '</s>', '<pad>', '<mask>', '<unk>',
+            }
+
+        if self.sp_model:
+            word_idx = -1
+            first_content_seen = False
+            prev_bare_tok: Optional[str] = None
+
+            for tok_pos, tok in enumerate(tokens):
+                if tok in special_tokens:
+                    continue
+
+                bare_tok = tok.lstrip('\u2581')
+                starts_new_word = tok.startswith('\u2581') or not first_content_seen
+
+                if starts_new_word and prev_bare_tok in _HYPHEN_JOINERS:
+                    starts_new_word = False
+
+                if starts_new_word:
+                    word_idx += 1
+                    first_content_seen = True
+
+                if 0 <= word_idx < len(words):
+                    word_ids[tok_pos] = word_idx
+
+                prev_bare_tok = bare_tok
+
+        else:
+            word_idx = -1
+
+            for tok_pos, tok in enumerate(tokens):
+                if tok in special_tokens:
+                    continue
+
+                if not tok.startswith('##'):
+                    word_idx += 1
+
+                if 0 <= word_idx < len(words):
+                    word_ids[tok_pos] = word_idx
+
+        return word_ids
+
+    def _hf_word_ids(self, encoding, n_words: int) -> Optional[List[Optional[int]]]:
+        if not getattr(self.tokenizer, 'is_fast', False):
+            return None
+        try:
+            ids = list(encoding.word_ids(0))
+        except Exception:
+            return None
+        if len(ids) != int(encoding['input_ids'].shape[1]):
+            return None
+        if sorted({i for i in ids if i is not None}) != list(range(n_words)):
+            return None
+        return ids
+
+    def embed_words(self, words: List[str]) -> Optional[WordEmbeddings]:
+        if not words:
+            return None
+        if not self.loaded:
+            raise RuntimeError("Model is not loaded. Call load_model() first.")
+
+        text = ' '.join(words)
+        encoding = self.tokenizer(
+            text,
+            return_tensors='pt',
+            add_special_tokens=True,
+            truncation=True,
+            max_length=ALIGNMENT_MAX_LENGTH,
+        )
+
+        hf_word_ids: Optional[List[Optional[int]]] = None
+        if self.spec.word_id_source == 'auto':
+            hf_word_ids = self._hf_word_ids(encoding, len(words))
+            if hf_word_ids is None:
+                logger.debug(
+                    "[FormatAlignment] HF word_ids unavailable or inconsistent – "
+                    "using legacy word id builder"
+                )
+
+        encoding = {k: v.to(self.model.device) for k, v in encoding.items()}
+
+        with torch.no_grad():
+            outputs = self.model(**encoding, output_hidden_states=True)
+
+        hidden = self.get_layer_output(outputs)
+
+        token_ids = encoding['input_ids'][0].tolist()
+        tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+        if hf_word_ids is not None:
+            word_ids = hf_word_ids
+        else:
+            word_ids = self.build_word_ids(words, tokens)
+
+        H = hidden.shape[-1]
+        word_embs = torch.zeros(len(words), H, device=self.model.device)
+        word_counts = torch.zeros(len(words), device=self.model.device)
+        first_only = self.spec.pooling == 'first'
+
+        for tok_idx, wi in enumerate(word_ids):
+            if wi is None or not 0 <= wi < len(words):
+                continue
+            if first_only and word_counts[wi] > 0:
+                continue
+            word_embs[wi] += hidden[tok_idx]
+            word_counts[wi] += 1
+
+        if word_counts.sum().item() == 0:
+            logger.warning(
+                f"[FormatAlignment] _get_word_embeddings: no word received an embedding "
+                f"(words={words[:5]}, tokens={tokens[:10]})"
+            )
+            return None
+
+        divisor = word_counts.clamp(min=1.0)
+        word_embs = word_embs / divisor.unsqueeze(-1)
+
+        return WordEmbeddings(
+            words=list(words),
+            vectors=word_embs,
+            token_word_ids=word_ids,
+            word_token_counts=word_counts,
+        )
 
 def _sanitize_model_name(model_name: str) -> str:
     return model_name.replace('/', '_').replace('\\', '_')
@@ -46,7 +429,7 @@ def is_model_downloaded(model_name: str, models_dir: str) -> bool:
     return os.path.isdir(local_path) and os.path.isfile(config_path)
 
 def download_model(
-    model_name: str = 'xlm-roberta-large',
+    model_name: str = 'microsoft/xlm-align-base',
     models_dir: str = '',
 ) -> str:
     if not models_dir:
@@ -54,25 +437,26 @@ def download_model(
             os.path.dirname(os.path.abspath(__file__)), MODELS_SUBDIR
         )
 
+    spec = resolve_model_spec(model_name)
+
     os.makedirs(models_dir, exist_ok=True)
+    cache_dir = _get_hf_cache_dir(models_dir)
+    os.makedirs(cache_dir, exist_ok=True)
     logger.info(f"[FormatAlignment] Models directory: {models_dir}")
+    logger.info(f"[FormatAlignment] HF cache directory: {cache_dir}")
 
     local_model_path = get_local_model_path(model_name, models_dir)
     os.makedirs(local_model_path, exist_ok=True)
 
-    logger.info(f"[FormatAlignment] Downloading model '{model_name}' → {local_model_path}")
+    logger.info(f"[FormatAlignment] Downloading model '{spec.model_id}' → {local_model_path}")
 
     logger.info("[FormatAlignment] Downloading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = _load_tokenizer(spec.model_id, cache_dir=cache_dir)
     tokenizer.save_pretrained(local_model_path)
     logger.info("[FormatAlignment] Tokenizer saved.")
 
     logger.info("[FormatAlignment] Downloading model (this may take several minutes)...")
-    model = AutoModel.from_pretrained(
-        model_name,
-        output_hidden_states=True,
-        ignore_mismatched_sizes=True,
-    )
+    model = _load_encoder(spec.model_id, cache_dir=cache_dir)
     model.save_pretrained(local_model_path)
     logger.info(f"[FormatAlignment] Model saved to: {local_model_path}")
 
@@ -126,8 +510,7 @@ def _build_attrs_str(attrs: Dict[str, str]) -> str:
     for k, v in attrs.items():
         if '{' in k:
             continue
-        escaped_v = v.replace('"', '&quot;')
-        parts.append(f' {k}="{escaped_v}"')
+        parts.append(f' {k}="{_escape_xml(v)}"')
     return ''.join(parts)
 
 def _escape_xml(text: str) -> str:
@@ -139,20 +522,11 @@ def _escape_xml(text: str) -> str:
         .replace('"', '&quot;')
     )
 
-def _try_auto_wrap(original_html: str, translated_text: str) -> Optional[str]:
-    """
-    If the *entire* text content of the paragraph element is wrapped
-    inside a single inline tag (e.g. <p><b>text</b></p>), return the
-    translated_text wrapped in that same tag as a full paragraph HTML
-    string.  Returns None when the condition is not met.
-
-    Detection rule:
-      • root.text is None or pure whitespace
-      • root has exactly one child element
-      • that child's local-name is in INLINE_TRANSFER_TAGS
-      • child.tail is None or pure whitespace  (no stray text after it)
-      • the child itself is not empty
-    """
+def _try_auto_wrap(
+    original_html: str,
+    translated_text: str,
+    transfer_tags=INLINE_TRANSFER_TAGS,
+) -> Optional[str]:
     root = _parse_element_html(original_html)
     if root is None:
         return None
@@ -165,7 +539,7 @@ def _try_auto_wrap(original_html: str, translated_text: str) -> Optional[str]:
 
     child = children[0]
     tag_local = etree.QName(child).localname if not hasattr(child.tag, '__call__') else ''
-    if tag_local not in INLINE_TRANSFER_TAGS:
+    if tag_local not in transfer_tags:
         return None
 
     trailing = (child.tail or '').strip()
@@ -175,7 +549,7 @@ def _try_auto_wrap(original_html: str, translated_text: str) -> Optional[str]:
     child_inline_children = [
         c for c in child
         if not callable(c.tag)
-        and etree.QName(c).localname.lower() in INLINE_TRANSFER_TAGS
+        and etree.QName(c).localname.lower() in transfer_tags
     ]
     if child_inline_children:
         return None
@@ -187,21 +561,21 @@ def _try_auto_wrap(original_html: str, translated_text: str) -> Optional[str]:
     root_local = etree.QName(root).localname if not hasattr(root.tag, '__call__') else 'p'
     root_attrs_str = _build_attrs_str(dict(root.attrib))
 
-    result = (
+    return (
         f'<{root_local}{root_attrs_str}>'
         f'<{tag_local}{attrs_str}>{escaped_trans}</{tag_local}>'
         f'</{root_local}>'
     )
-    return result
 
 class FormatAlignmentEngine:
     _ALIGN_LAYER_FALLBACK = 8
 
     def __init__(
         self,
-        model_name: str = 'xlm-roberta-large',
+        model_name: str = 'microsoft/xlm-align-base',
         device: str = 'cpu',
         local_models_dir: str = '',
+        model_spec: Optional[ModelSpec] = None,
     ) -> None:
         self.model_name = model_name
         self.device = device
@@ -213,6 +587,8 @@ class FormatAlignmentEngine:
                 os.path.dirname(os.path.abspath(__file__)), MODELS_SUBDIR
             )
 
+        self.model_spec = model_spec if model_spec is not None else resolve_model_spec(model_name)
+        self._adapter: Optional[WordEmbeddingAdapter] = None
         self.tokenizer = None
         self.model = None
         self._loaded = False
@@ -224,86 +600,49 @@ class FormatAlignmentEngine:
         self._last_alignment_corrections: int = 0
         self._last_alignment_corrections_detail: List[str] = []
         self._last_sent_map: Dict[int, Tuple[int, int, int, int]] = {}
+        self._transfer_tags = INLINE_TRANSFER_TAGS
+        self._reserve_tags = RESERVE_TAGS
+
+    def _set_tag_mode(self, extended: bool) -> None:
+        if extended:
+            self._transfer_tags = EXTENDED_TRANSFER_TAGS
+            self._reserve_tags = EXTENDED_RESERVE_TAGS
+        else:
+            self._transfer_tags = INLINE_TRANSFER_TAGS
+            self._reserve_tags = RESERVE_TAGS
 
     def load_model(self) -> None:
-        local_path = get_local_model_path(self.model_name, self.local_models_dir)
+        adapter = WordEmbeddingAdapter(
+            model_name=self.model_name,
+            device=self.device,
+            local_models_dir=self.local_models_dir,
+            spec=self.model_spec,
+        )
+        adapter.load()
 
-        if is_model_downloaded(self.model_name, self.local_models_dir):
-            load_source = local_path
-            logger.info(f"[FormatAlignment] Loading model from local directory: {local_path}")
-        else:
-            load_source = self.model_name
-            logger.info(
-                f"[FormatAlignment] Local model not found at: {local_path}\n"
-                f"[FormatAlignment] Loading from HuggingFace Hub: '{self.model_name}'"
-            )
-
-        logger.info(f"[FormatAlignment] Device: {self.device}")
-
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(load_source)
-            self.model = AutoModel.from_pretrained(
-                load_source,
-                output_hidden_states=True,
-                ignore_mismatched_sizes=True,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to load model '{self.model_name}' from '{load_source}': {exc}"
-            ) from exc
-
-        self.model.eval()
-        self.model.to(torch.device(self.device))
+        self._adapter = adapter
+        self.tokenizer = adapter.tokenizer
+        self.model = adapter.model
+        self._align_layers = list(adapter.align_layers)
+        self._sp_model = adapter.sp_model
         self._loaded = True
 
-        self._detect_tokenizer_type()
-        self._detect_align_layers()
-
-        logger.info(
-            f"[FormatAlignment] Model '{self.model_name}' loaded successfully "
-            f"on '{self.device}'. "
-            f"Alignment layers: {self._align_layers}. "
-            f"SentencePiece: {self._sp_model}."
-        )
-
     def _detect_tokenizer_type(self) -> None:
-        test_tokens = self.tokenizer.tokenize("hello world")
-        self._sp_model = any(t.startswith('\u2581') for t in test_tokens)
-        logger.debug(
-            f"[FormatAlignment] Test tokens: {test_tokens} | "
-            f"SentencePiece={self._sp_model}"
-        )
+        if self._adapter is None:
+            return
+        self._adapter.detect_tokenizer_type()
+        self._sp_model = self._adapter.sp_model
 
     def _detect_align_layers(self) -> None:
-        n_layers = None
-
-        try:
-            cfg = self.model.config
-            if hasattr(cfg, 'encoder_layers'):
-                n_layers = cfg.encoder_layers
-            elif hasattr(cfg, 'num_hidden_layers'):
-                n_layers = cfg.num_hidden_layers
-        except Exception as exc:
-            logger.warning(f"[FormatAlignment] Failed to read layer count from config: {exc}")
-
-        if n_layers and n_layers > 0:
-            target = max(2, round(n_layers / 3))
-            first  = max(1, target - 1)
-            last   = min(n_layers, target + 1)
-            self._align_layers = list(range(first, last + 1))
-        else:
-            logger.warning(
-                f"[FormatAlignment] Unknown layer count – "
-                f"using fallback layer {self._ALIGN_LAYER_FALLBACK}"
-            )
-            self._align_layers = [self._ALIGN_LAYER_FALLBACK]
-
-        logger.info(
-            f"[FormatAlignment] Detected {n_layers} layers. "
-            f"Alignment layers: {self._align_layers}"
-        )
+        if self._adapter is None:
+            return
+        self._adapter.detect_align_layers()
+        self._align_layers = list(self._adapter.align_layers)
 
     def unload_model(self) -> None:
+        if self._adapter is not None:
+            self._adapter.unload()
+        self._adapter = None
         self.model = None
         self.tokenizer = None
         self._loaded = False
@@ -323,42 +662,17 @@ class FormatAlignmentEngine:
         return self._loaded
 
     def _get_layer_output(self, outputs) -> 'torch.Tensor':
-        if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-            available = len(outputs.hidden_states)
-            layers = [l for l in self._align_layers if l < available]
-            if not layers:
-                layers = [available - 1]
-            stacked = torch.stack(
-                [outputs.hidden_states[l][0] for l in layers], dim=0
-            )
-            return stacked.mean(dim=0)
+        if self._adapter is None:
+            raise RuntimeError("Model is not loaded. Call load_model() first.")
+        return self._adapter.get_layer_output(outputs)
 
-        if (hasattr(outputs, 'encoder_hidden_states')
-                and outputs.encoder_hidden_states is not None):
-            available = len(outputs.encoder_hidden_states)
-            layers = [l for l in self._align_layers if l < available]
-            if not layers:
-                layers = [available - 1]
-            stacked = torch.stack(
-                [outputs.encoder_hidden_states[l][0] for l in layers], dim=0
-            )
-            return stacked.mean(dim=0)
-
-        if (hasattr(outputs, 'last_hidden_state')
-                and outputs.last_hidden_state is not None):
-            logger.debug("[FormatAlignment] Using last_hidden_state as fallback")
-            return outputs.last_hidden_state[0]
-
-        raise RuntimeError(
-            "[FormatAlignment] Model returned no hidden_states. "
-            "Make sure the model is loaded with output_hidden_states=True."
-        )
-
-    def align_batch(self, paragraphs: List[Dict]) -> int:
+    def align_batch(self, paragraphs: List[Dict], extended_tags: bool = False) -> int:
         if not self._loaded:
             raise RuntimeError(
                 "Model is not loaded. Call load_model() first."
             )
+
+        self._set_tag_mode(extended_tags)
 
         processed = 0
         skipped_no_inline = 0
@@ -406,7 +720,7 @@ class FormatAlignmentEngine:
                 skipped_other += 1
                 continue
 
-            if '<a ' in original_html or '<a>' in original_html:
+            if not extended_tags and ('<a ' in original_html or '<a>' in original_html):
                 logger.debug(
                     f"[FormatAlignment] Para {para.get('id', '?')} "
                     f"contains <a> – skipping alignment"
@@ -414,7 +728,7 @@ class FormatAlignmentEngine:
                 skipped_reserve += 1
                 continue
 
-            auto_wrapped = _try_auto_wrap(original_html, clean_translated)
+            auto_wrapped = _try_auto_wrap(original_html, clean_translated, self._transfer_tags)
             if auto_wrapped is not None:
                 para['aligned_translated_html'] = auto_wrapped
                 para['alignment_corrections'] = 0
@@ -432,7 +746,7 @@ class FormatAlignmentEngine:
                 continue
 
             try:
-                result_html = self.align_element(original_html, clean_translated)
+                result_html = self.align_element(original_html, clean_translated, extended_tags)
                 if result_html:
                     para['aligned_translated_html'] = result_html
                     _ALIGNMENT_UNCERTAIN_THRESHOLD = 2
@@ -795,7 +1109,9 @@ class FormatAlignmentEngine:
 
         return all_alignments
 
-    def align_element(self, original_html: str, translated_text: str) -> str:
+    def align_element(self, original_html: str, translated_text: str, extended_tags: bool = False) -> str:
+        self._set_tag_mode(extended_tags)
+
         if not original_html or not translated_text:
             return ''
 
@@ -807,10 +1123,11 @@ class FormatAlignmentEngine:
             logger.debug("[FormatAlignment] Failed to parse original_html")
             return ''
 
-        has_links = orig_elem.xpath('.//*[local-name()="a"]')
-        if has_links:
-            logger.debug("[FormatAlignment] Element contains <a> – skipping")
-            return ''
+        if not extended_tags:
+            has_links = orig_elem.xpath('.//*[local-name()="a"]')
+            if has_links:
+                logger.debug("[FormatAlignment] Element contains <a> – skipping")
+                return ''
 
         inline_spans = self._extract_inline_spans(orig_elem)
         if not inline_spans:
@@ -1008,7 +1325,7 @@ class FormatAlignmentEngine:
         tag_name = etree.QName(element).localname
 
         current_tags = list(parent_tags)
-        if tag_name.lower() in INLINE_TRANSFER_TAGS:
+        if tag_name.lower() in self._transfer_tags:
             attrs = {
                 k: v for k, v in element.attrib.items()
                 if not k.startswith('{')
@@ -1026,7 +1343,7 @@ class FormatAlignmentEngine:
                 continue
             child_tag = etree.QName(child).localname
 
-            if child_tag.lower() in RESERVE_TAGS:
+            if child_tag.lower() in self._reserve_tags:
                 if child.tail:
                     for word in child.tail.split():
                         if word and _RE_CONTENT_WORD.search(word):
@@ -1081,15 +1398,6 @@ class FormatAlignmentEngine:
         tgt_content_len = max(1, len(tgt_content_indices))
 
         def _prop_tgt(src_pos: int) -> int:
-            """Map a src content-word index to the nearest tgt content-word index.
-
-            When sentence boundary data is available (populated by
-            _compute_alignments_by_sentences), the proportion is computed
-            within the matched sentence pair instead of the full paragraph.
-            This prevents structural word-order differences (e.g. EN→PL where
-            "always" is at 67% of the paragraph but at the START of its
-            sentence) from shifting correct neural positions to wrong ones.
-            """
             sent = self._last_sent_map.get(src_pos)
             if sent:
                 ss, se, ts, te = sent
@@ -1122,6 +1430,9 @@ class FormatAlignmentEngine:
             w = _RE_PUNCT_STRIP.sub('', w)
             return w
 
+        def _strip_trailing_punct(word: str) -> str:
+            return _RE_PUNCT_STRIP.sub('', word)
+
         for span in spans:
             if 'first-letter' in span.get('attrs', {}).get('class', '').split():
                 result.append({'tag': span['tag'], 'attrs': span['attrs'], 'word_start': 0, 'word_end': 0})
@@ -1153,7 +1464,8 @@ class FormatAlignmentEngine:
                 t_start = max(0, min(tgt_indices))
                 t_end   = min(tgt_len - 1, max(tgt_indices))
 
-            drift_limit = max(1, int(0.20 * tgt_len) if span_len <= 3 else int(0.35 * tgt_len))
+            # Floor of 2 prevents 1-position neural vs prop diffs from wiping a good contiguous span
+            drift_limit = max(2, int(0.20 * tgt_len) if span_len <= 3 else int(0.35 * tgt_len))
             if abs(t_start - prop_t_start) >= drift_limit:
                 t_start, t_end = prop_t_start, prop_t_end
 
@@ -1192,6 +1504,78 @@ class FormatAlignmentEngine:
 
             current_n = t_end - t_start + 1
             expected_n = max(1, round(span_len * tgt_len / max(1, src_len)))
+
+            # Left-expand when neural under-covers a multi-word span
+            if span_len >= 2 and current_n < span_len and t_start > 0:
+                deficit = span_len - current_n
+                first_src_mapped = bool(src_to_tgt.get(ws))
+                prop_suggests_left = prop_t_start < t_start
+                if (not first_src_mapped) or prop_suggests_left or deficit <= 2:
+                    expand = min(deficit, t_start)
+                    new_start = t_start
+                    for k in range(1, expand + 1):
+                        cand = t_start - k
+                        if cand < 0 or not is_content[cand]:
+                            break
+                        new_start = cand
+                    if new_start < t_start:
+                        logger.debug(
+                            f"[FormatAlignment] LeftExpand '{span['tag']}': "
+                            f"[{t_start}-{t_end}]→[{new_start}-{t_end}] "
+                            f"(deficit={deficit}, first_mapped={first_src_mapped})"
+                        )
+                        t_start = new_start
+                        current_n = t_end - t_start + 1
+                        self._last_alignment_corrections += 1
+                        self._last_alignment_corrections_detail.append(
+                            f"LeftExpand(def={deficit})@{span['tag']}[{ws}-{we}]"
+                        )
+
+            # Span-level mean-embedding re-anchor (kept; neutral in current benchmark)
+            if (span_len >= 2
+                    and span.get('parent_src_id') is None
+                    and self._full_src_embs is not None
+                    and self._full_tgt_embs is not None):
+                src_mean = F.normalize(
+                    self._full_src_embs[ws:we + 1].mean(dim=0, keepdim=True),
+                    p=2, dim=-1,
+                )
+                window = max(span_len, min(span_len + 1, expected_n))
+                search_lo = max(0, prop_t_start - 4)
+                search_hi = min(tgt_len - window, prop_t_start + 6)
+                best_sim = -9.0
+                best_ts = t_start
+                for _ts in range(search_lo, search_hi + 1):
+                    _te = _ts + window - 1
+                    if _te >= tgt_len:
+                        break
+                    tgt_mean = F.normalize(
+                        self._full_tgt_embs[_ts:_te + 1].mean(dim=0, keepdim=True),
+                        p=2, dim=-1,
+                    )
+                    _sim = torch.mm(src_mean, tgt_mean.t()).item()
+                    if _sim > best_sim:
+                        best_sim = _sim
+                        best_ts = _ts
+                cur_te = min(tgt_len - 1, t_start + window - 1)
+                cur_mean = F.normalize(
+                    self._full_tgt_embs[t_start:cur_te + 1].mean(dim=0, keepdim=True),
+                    p=2, dim=-1,
+                )
+                cur_sim = torch.mm(src_mean, cur_mean.t()).item()
+                if best_sim > cur_sim + 0.06 and best_ts != t_start:
+                    logger.debug(
+                        f"[FormatAlignment] SpanMeanReanchor '{span['tag']}': "
+                        f"[{t_start}-{t_end}]→[{best_ts}-{best_ts + window - 1}] "
+                        f"(sim={best_sim:.3f} vs {cur_sim:.3f})"
+                    )
+                    t_start = best_ts
+                    t_end = min(tgt_len - 1, best_ts + window - 1)
+                    current_n = t_end - t_start + 1
+                    self._last_alignment_corrections += 1
+                    self._last_alignment_corrections_detail.append(
+                        f"SpanMeanReanchor(sim={best_sim:.3f})@{span['tag']}[{ws}-{we}]"
+                    )
 
             if _neural_is_contiguous_multi or current_n >= span_len - 1:
                 if span_len <= 3:
@@ -1353,14 +1737,14 @@ class FormatAlignmentEngine:
                                 f"SlidingWin2(cosine,gain={_gain:.2f})@{span['tag']}[{ws}-{we}]"
                             )
 
+                    # Only shift when the LEADING target word is a short function word.
+                    # Previous "any word len<=2" caused non-converging rightward drift
+                    # on Polish "w" inside otherwise good spans (n2).
                     if _exact_anchor is None and span_len >= 2:
                         for _cs in range(3):
-                            _has_func = any(
-                                len(_norm_w(tgt_words[_i])) <= 2
-                                for _i in range(t_start, t_end + 1)
-                                if _i < tgt_len
-                            )
-                            if not _has_func:
+                            if t_start >= tgt_len:
+                                break
+                            if len(_norm_w(tgt_words[t_start])) > 2:
                                 break
                             if t_end + 1 >= tgt_len:
                                 break
@@ -1368,6 +1752,22 @@ class FormatAlignmentEngine:
                             t_end += 1
 
                 else:
+                    if current_n < span_len and t_start > 0:
+                        deficit = span_len - current_n
+                        new_start = max(0, t_start - deficit)
+                        while new_start < t_start and not is_content[new_start]:
+                            new_start += 1
+                        if new_start < t_start:
+                            logger.debug(
+                                f"[FormatAlignment] LongLeftExpand '{span['tag']}': "
+                                f"[{t_start}-{t_end}]→[{new_start}-{t_end}]"
+                            )
+                            t_start = new_start
+                            current_n = t_end - t_start + 1
+                            self._last_alignment_corrections += 1
+                            self._last_alignment_corrections_detail.append(
+                                f"LongLeftExpand(def={deficit})@{span['tag']}[{ws}-{we}]"
+                            )
                     max_allowed = span_len + 2
                     if current_n > max_allowed:
                         excess = current_n - max_allowed
@@ -1398,6 +1798,11 @@ class FormatAlignmentEngine:
             if trimmed is None:
                 continue
             t_start, t_end = trimmed
+
+            if t_end > t_start:
+                last_w = tgt_words[t_end]
+                if not _RE_CONTENT_WORD.search(_strip_trailing_punct(last_w)):
+                    t_end -= 1
 
             result.append({
                 'tag':        span['tag'],
@@ -1656,97 +2061,159 @@ class FormatAlignmentEngine:
     def _get_word_embeddings(self, words: List[str]):
         if not words:
             return None
-
-        text = ' '.join(words)
-        encoding = self.tokenizer(
-            text,
-            return_tensors='pt',
-            add_special_tokens=True,
-            truncation=True,
-            max_length=512,
-        )
-        encoding = {k: v.to(self.model.device) for k, v in encoding.items()}
-
-        with torch.no_grad():
-            outputs = self.model(**encoding, output_hidden_states=True)
-
-        hidden = self._get_layer_output(outputs)
-
-        token_ids = encoding['input_ids'][0].tolist()
-        tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
-        word_ids = self._build_word_ids(words, tokens)
-
-        H = hidden.shape[-1]
-        word_embs = torch.zeros(len(words), H, device=self.model.device)
-        word_counts = torch.zeros(len(words), device=self.model.device)
-
-        for tok_idx, wi in enumerate(word_ids):
-            if wi is not None and 0 <= wi < len(words):
-                word_embs[wi] += hidden[tok_idx]
-                word_counts[wi] += 1
-
-        if word_counts.sum().item() == 0:
-            logger.warning(
-                f"[FormatAlignment] _get_word_embeddings: no word received an embedding "
-                f"(words={words[:5]}, tokens={tokens[:10]})"
-            )
+        if self._adapter is None:
+            raise RuntimeError("Model is not loaded. Call load_model() first.")
+        result = self._adapter.embed_words(words)
+        if result is None:
             return None
-
-        word_counts = word_counts.clamp(min=1.0)
-        word_embs = word_embs / word_counts.unsqueeze(-1)
-
-        return word_embs
+        return result.vectors
 
     def _build_word_ids(
         self,
         words: List[str],
         tokens: List[str],
     ) -> List[Optional[int]]:
-        word_ids: List[Optional[int]] = [None] * len(tokens)
+        if self._adapter is None:
+            raise RuntimeError("Model is not loaded. Call load_model() first.")
+        return self._adapter.build_word_ids(words, tokens)
+        
+BENCHMARK_CASES: List[Dict[str, Any]] = [
+    {
+        'html': '<p>The old <i>wooden door</i> creaked loudly in the wind.</p>',
+        'translation': 'La vieja puerta de madera crujió con fuerza en el viento.',
+        'expected': [('i', 'puerta de madera')],
+    },
+    {
+        'html': '<p>He bought <b>three red apples</b> at the market yesterday.</p>',
+        'translation': 'Er hat gestern auf dem Markt drei rote Äpfel gekauft.',
+        'expected': [('b', 'drei rote Äpfel')],
+    },
+    {
+        'html': '<p>They finally reached the <em>ancient castle</em> before sunset.</p>',
+        'translation': 'Ils ont enfin atteint le vieux château avant le coucher du soleil.',
+        'expected': [('em', 'vieux château')],
+    },
+    {
+        'html': (
+            '<p>The scientist described the <i>extraordinarily complicated</i> '
+            'mechanism in detail.</p>'
+        ),
+        'translation': (
+            'Der Wissenschaftler beschrieb den außerordentlich komplizierten '
+            'Mechanismus ausführlich.'
+        ),
+        'expected': [('i', 'außerordentlich komplizierten')],
+    },
+    {
+        'html': '<p><b>Chapter One</b> began with a <i>strange</i> dream about the sea.</p>',
+        'translation': 'Capítulo Uno comenzó con un extraño sueño sobre el mar.',
+        'expected': [('b', 'Capítulo Uno'), ('i', 'extraño')],
+    },
+]
 
+
+def _extract_tagged_spans(result_html: str) -> List[Tuple[str, str]]:
+    if not result_html:
+        return []
+    try:
+        root = etree.fromstring(result_html.encode('utf-8'))
+    except etree.XMLSyntaxError:
+        return []
+    spans: List[Tuple[str, str]] = []
+    for el in root.iter():
+        if el is root or callable(el.tag):
+            continue
+        name = etree.QName(el).localname
+        if name in INLINE_TRANSFER_TAGS:
+            spans.append((name, ' '.join(''.join(el.itertext()).split())))
+    return spans
+
+
+def run_alignment_benchmark(
+    model_names: Optional[Sequence[str]] = None,
+    device: str = 'cpu',
+    local_models_dir: str = '',
+    cases: Optional[List[Dict[str, Any]]] = None,
+    word_id_sources: Sequence[str] = ('legacy', 'auto'),
+) -> List[Dict[str, Any]]:
+    names = list(model_names) if model_names else list(AVAILABLE_MODELS.keys())
+    test_cases = cases if cases is not None else BENCHMARK_CASES
+    if not test_cases:
+        raise ValueError("No benchmark cases provided.")
+
+    rows: List[Dict[str, Any]] = []
+
+    for name in names:
+        engine = FormatAlignmentEngine(
+            model_name=name,
+            device=device,
+            local_models_dir=local_models_dir,
+        )
         try:
-            special_tokens: set = set(self.tokenizer.all_special_tokens)
-        except Exception:
-            special_tokens = {
-                '[CLS]', '[SEP]', '[PAD]', '[MASK]', '[UNK]',
-                '<s>', '</s>', '<pad>', '<mask>', '<unk>',
-            }
+            started = time.perf_counter()
+            engine.load_model()
+            load_seconds = time.perf_counter() - started
+        except Exception as exc:
+            rows.append({'model': name, 'error': str(exc)})
+            continue
 
-        if self._sp_model:
-            word_idx = -1
-            first_content_seen = False
-            prev_bare_tok: Optional[str] = None
+        base_spec = engine._adapter.spec
+        try:
+            engine.align_element(test_cases[0]['html'], test_cases[0]['translation'])
 
-            for tok_pos, tok in enumerate(tokens):
-                if tok in special_tokens:
-                    continue
+            for source in word_id_sources:
+                engine._adapter.spec = replace(base_spec, word_id_source=source)
+                durations: List[float] = []
+                hits = 0
+                total = 0
+                valid = 0
 
-                bare_tok = tok.lstrip('\u2581')
-                starts_new_word = tok.startswith('\u2581') or not first_content_seen
+                for case in test_cases:
+                    started = time.perf_counter()
+                    result = engine.align_element(case['html'], case['translation'])
+                    durations.append(time.perf_counter() - started)
 
-                if starts_new_word and prev_bare_tok in _HYPHEN_JOINERS:
-                    starts_new_word = False
+                    spans = _extract_tagged_spans(result)
+                    if result and spans:
+                        valid += 1
+                    for item in case.get('expected', []):
+                        total += 1
+                        if item in spans:
+                            hits += 1
 
-                if starts_new_word:
-                    word_idx += 1
-                    first_content_seen = True
+                rows.append({
+                    'model': name,
+                    'word_id_source': source,
+                    'load_s': load_seconds,
+                    'avg_ms': 1000.0 * sum(durations) / len(durations),
+                    'span_accuracy': (hits / total) if total else None,
+                    'valid': f"{valid}/{len(test_cases)}",
+                })
+        finally:
+            engine._adapter.spec = base_spec
+            engine.unload_model()
 
-                if 0 <= word_idx < len(words):
-                    word_ids[tok_pos] = word_idx
+    header = f"{'model':34} {'src':7} {'load[s]':>8} {'avg[ms]':>9} {'spans':>7} {'valid':>6}"
+    print(header)
+    print('-' * len(header))
+    for row in rows:
+        if 'error' in row:
+            print(f"{row['model']:34} ERROR: {row['error']}")
+            continue
+        accuracy = row['span_accuracy']
+        accuracy_text = f"{accuracy:.2f}" if accuracy is not None else 'n/a'
+        print(
+            f"{row['model']:34} {row['word_id_source']:7} {row['load_s']:8.1f} "
+            f"{row['avg_ms']:9.1f} {accuracy_text:>7} {row['valid']:>6}"
+        )
 
-                prev_bare_tok = bare_tok
+    return rows
 
-        else:
-            word_idx = -1
 
-            for tok_pos, tok in enumerate(tokens):
-                if tok in special_tokens:
-                    continue
-
-                if not tok.startswith('##'):
-                    word_idx += 1
-
-                if 0 <= word_idx < len(words):
-                    word_ids[tok_pos] = word_idx
-
-        return word_ids
+if __name__ == '__main__':
+    import sys
+    logging.basicConfig(
+        level=logging.WARNING,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+    )
+    run_alignment_benchmark(model_names=sys.argv[1:] or None)
