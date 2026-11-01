@@ -1,6 +1,7 @@
 # app.py
 import ctypes
 import deepl
+import json
 import logging
 import os
 import re
@@ -15,14 +16,16 @@ from app_utils import (
     PromptManager,
     SessionManager,
     TagProfile,
+    is_valid_wrapper_variant_name,
+    normalize_wrapper_variants,
 )
 from deep_translator import GoogleTranslator
 from epub_creator_lxml import EPUBCreatorLxml
 from file_processors import EPUBWriter, FB2Writer, DOCXWriter, FileProcessorFactory
 from format_alignment import (
+    EXTENDED_TRANSFER_TAGS,
     FormatAlignmentEngine,
     INLINE_TRANSFER_TAGS,
-    download_model as _download_alignment_model_fn,
     download_model as _fa_download_model,
     get_local_model_path,
     is_model_downloaded,
@@ -190,7 +193,6 @@ class TranslationBatchWorkerThread(QThread):
         batch_hint_template="",
         top_p=None,
         top_k=None,
-        response_wrapper_tag="translated"
     ):
         super().__init__()
         self.orchestrator = orchestrator
@@ -205,7 +207,6 @@ class TranslationBatchWorkerThread(QThread):
         self.batch_hint_template = batch_hint_template
         self.top_p = top_p
         self.top_k = top_k
-        self.response_wrapper_tag = (response_wrapper_tag or "translated").strip() or "translated"
         self._cancelled = False
 
     def request_cancel(self):
@@ -253,6 +254,9 @@ class TranslationBatchWorkerThread(QThread):
                         context_after=""
                     )
 
+                    for frag in self.fragments:
+                        frag['llm_prompt'] = prompt
+
                     response = self.orchestrator.llm_client.translate(
                         prompt,
                         self.temperature,
@@ -270,11 +274,7 @@ class TranslationBatchWorkerThread(QThread):
 
                     last_response = response.strip()
 
-                    custom_tag = self.response_wrapper_tag
-                    if custom_tag and custom_tag.lower() not in ('translated', 'translation'):
-                        tags_pattern = f'(?:{re.escape(custom_tag)}|translated|translation)'
-                    else:
-                        tags_pattern = r'(?:translated|translation)'
+                    tags_pattern = self.orchestrator.get_wrapper_tags_pattern()
 
                     outer_match = re.match(
                         rf'^<{tags_pattern}>(.*)</{tags_pattern}>$',
@@ -313,12 +313,13 @@ class AlignmentWorkerThread(QThread):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal()
 
-    def __init__(self, paragraphs, model_name, device, models_dir):
+    def __init__(self, paragraphs, model_name, device, models_dir, extended_tags=False):
         super().__init__()
         self.paragraphs = paragraphs
         self.model_name = model_name
         self.device = device
         self.models_dir = models_dir
+        self.extended_tags = extended_tags
         self._cancelled = False
 
     def request_cancel(self):
@@ -345,7 +346,7 @@ class AlignmentWorkerThread(QThread):
             for para in self.paragraphs:
                 if self._cancelled:
                     break
-                engine.align_batch([para])
+                engine.align_batch([para], extended_tags=self.extended_tags)
                 completed += 1
                 self.progress.emit(completed, total)
 
@@ -574,27 +575,15 @@ class TXTCreator(QThread):
             self.finished.emit(str(e), True)
 
 class AlignmentSaveDialog(QDialog):
-    """
-    Dialog shown before saving a Legacy-mode EPUB that has aligned fragments.
-    Lets the user choose which alignment quality levels (dot colours) to
-    include in the saved file.  Fragments whose dot is not selected are saved
-    with plain translated text instead of the aligned HTML.
-    """
-
     _DOT_DEFS = [
         ('🟢', 'Green',  'Auto-wrap / manually confirmed',  True),
         ('🟡', 'Yellow', 'Neural model — probably OK',      True),
         ('🟠', 'Orange', 'Neural model — worth checking',   False),
     ]
 
-    def __init__(self, counts, parent=None):
-        """
-        Parameters
-        ----------
-        counts : dict  {emoji: int}  number of aligned paragraphs per dot
-        """
+    def __init__(self, counts, output_label="EPUB", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Save EPUB — Alignment Filter")
+        self.setWindowTitle(f"Save {output_label} — Alignment Filter")
         self.setMinimumWidth(460)
         self.setStyleSheet("""
             QDialog { background-color: #1e1e1e; color: #cccccc; }
@@ -627,7 +616,7 @@ class AlignmentSaveDialog(QDialog):
         layout.setContentsMargins(18, 14, 18, 14)
 
         intro = QLabel(
-            "This EPUB uses <b>Legacy mode</b> with alignment data.<br>"
+            "This document uses <b>Legacy mode</b> with alignment data.<br>"
             "Choose which alignment quality levels to include in the saved file.<br>"
             "<span style='color:#888;font-size:11px;'>"
             "Excluded fragments will be saved with plain translated text.</span>"
@@ -687,7 +676,7 @@ class AlignmentSaveDialog(QDialog):
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
         btn_row.addWidget(btn_cancel)
-        btn_save = QPushButton("Save EPUB")
+        btn_save = QPushButton(f"Save {output_label}")
         btn_save.setObjectName("save_btn")
         btn_save.setDefault(True)
         btn_save.clicked.connect(self.accept)
@@ -695,7 +684,6 @@ class AlignmentSaveDialog(QDialog):
         layout.addLayout(btn_row)
 
     def selected_dots(self):
-        """Return set of dot emojis the user wants to INCLUDE."""
         return {emoji for emoji, cb in self._checkboxes.items() if cb.isChecked()}
 
 
@@ -763,6 +751,13 @@ def _html_restore_outer_tag(inner: str, original_html: str) -> str:
 
 class TranslatorApp(QMainWindow):
     _download_done_signal = pyqtSignal(str, str, str)
+    _ALIGNMENT_EXTENDED_FORMATS = frozenset({'fb2', 'docx', 'mobi', 'azw3'})
+    _RE_ALIGN_INLINE = re.compile(
+        r'<(?:' + '|'.join(re.escape(t) for t in sorted(INLINE_TRANSFER_TAGS, key=len, reverse=True)) + r')(?=[\s>/])'
+    )
+    _RE_ALIGN_EXTENDED = re.compile(
+        r'<(?:' + '|'.join(re.escape(t) for t in sorted(EXTENDED_TRANSFER_TAGS, key=len, reverse=True)) + r')(?=[\s>/])'
+    )
 
     def __init__(self):
         super().__init__()
@@ -814,6 +809,7 @@ class TranslatorApp(QMainWindow):
 
         self._hard_cancel_mode: bool = False
         self._auto_save_counter: int = 0
+        self._pending_alignment_after_download: bool = False
 
         self._download_done_signal.connect(self._on_download_done_slot)
         self._preview_engine = EPUBPreviewEngine()
@@ -839,6 +835,8 @@ class TranslatorApp(QMainWindow):
                         self.quote_style_combo.setCurrentIndex(i)
                         break
 
+        PromptManager.set_active_profile(PromptManager.resolve_prompt_profile(self.app_settings))
+
         self.tag_profile = TagProfile.from_settings(self.app_settings)
         self._preview_engine = EPUBPreviewEngine(tag_profile=self.tag_profile)
 
@@ -856,6 +854,7 @@ class TranslatorApp(QMainWindow):
                 self.file_type,
                 quote_style=self.app_settings.get('quote_style', 'neutral'),
                 response_wrapper_tag=self.app_settings.get('response_wrapper_tag', 'translated'),
+                response_wrapper_tag_variants=self.app_settings.get('response_wrapper_tag_variants', []),
                 tag_profile=self.tag_profile
             )
         else:
@@ -1385,6 +1384,59 @@ class TranslatorApp(QMainWindow):
         preview_splitter.addWidget(trans_container)
 
         translation_tab_layout.addWidget(preview_splitter, stretch=1)
+        self.btn_llm_prompt_toggle = QPushButton("▶  LLM Prompt")
+        self.btn_llm_prompt_toggle.setCheckable(True)
+        self.btn_llm_prompt_toggle.setChecked(False)
+        self.btn_llm_prompt_toggle.setStyleSheet("""
+            QPushButton {
+                background-color: #1e1e1e; color: #999;
+                border: 1px solid #2e2e2e; border-radius: 3px;
+                padding: 5px 12px; font-size: 11px;
+                text-align: left; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #252525; color: #ccc; }
+            QPushButton:checked {
+                background-color: #1c2025; color: #99bbdd;
+                border-color: #3a4a5a;
+                border-bottom-left-radius: 0px; border-bottom-right-radius: 0px;
+            }
+        """)
+        self.btn_llm_prompt_toggle.toggled.connect(self._on_llm_prompt_toggled)
+        translation_tab_layout.addWidget(self.btn_llm_prompt_toggle)
+
+        self.llm_prompt_container = QWidget()
+        self.llm_prompt_container.setStyleSheet("""
+            QWidget {
+                background-color: #141414;
+                border: 1px solid #2e2e2e;
+                border-top: none;
+                border-bottom-left-radius: 3px;
+                border-bottom-right-radius: 3px;
+            }
+        """)
+        llm_prompt_container_layout = QVBoxLayout(self.llm_prompt_container)
+        llm_prompt_container_layout.setContentsMargins(6, 6, 6, 6)
+        llm_prompt_container_layout.setSpacing(0)
+
+        self.llm_prompt_view = QPlainTextEdit()
+        self.llm_prompt_view.setReadOnly(True)
+        self.llm_prompt_view.setPlaceholderText("No LLM prompt stored for this fragment.")
+        self.llm_prompt_view.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #0e0e0e; color: #c8c8c8;
+                border: 1px solid #222;
+                border-radius: 3px;
+                padding: 8px;
+                font-family: Consolas, "Courier New", monospace;
+                font-size: 12px;
+                selection-background-color: #1e3a5f;
+            }
+        """)
+        self.llm_prompt_view.setMinimumHeight(100)
+        llm_prompt_container_layout.addWidget(self.llm_prompt_view)
+
+        self.llm_prompt_container.setVisible(False)
+        translation_tab_layout.addWidget(self.llm_prompt_container)
         self.btn_llm_response_toggle = QPushButton("▶  LLM Raw Response")
         self.btn_llm_response_toggle.setCheckable(True)
         self.btn_llm_response_toggle.setChecked(False)
@@ -2216,11 +2268,13 @@ class TranslatorApp(QMainWindow):
 
         self.server_url_label = form_label("Server URL:")
         self.server_url_edit = QLineEdit()
-        self.server_url_edit.setPlaceholderText("e.g., http://localhost:1234/v1/chat/completions")
+        self.server_url_edit.setPlaceholderText("http://localhost:1234/v1/chat/completions")
         self.server_url_edit.setStyleSheet(INPUT_STYLE)
         self.server_url_edit.setToolTip(
-            "Custom endpoint URL for LM Studio, Lemonade, or any OpenAI-compatible server.\n"
-            "Leave empty to use the default: http://localhost:1234/v1/chat/completions"
+            "Full endpoint URL for LM Studio, Lemonade, or any OpenAI-compatible server.\n\n"
+            "Default (prefilled): http://localhost:1234/v1/chat/completions\n\n"
+            "Use the FULL path ending in /chat/completions.\n"
+            "If left empty, the default will be used automatically."
         )
         engine_form.addRow(self.server_url_label, self.server_url_edit)
 
@@ -2232,11 +2286,13 @@ class TranslatorApp(QMainWindow):
 
         self.ollama_server_url_label = form_label("Ollama Server URL:")
         self.ollama_server_url_edit = QLineEdit()
-        self.ollama_server_url_edit.setPlaceholderText("e.g., http://localhost:11434")
+        self.ollama_server_url_edit.setPlaceholderText("http://localhost:11434")
         self.ollama_server_url_edit.setStyleSheet(INPUT_STYLE)
         self.ollama_server_url_edit.setToolTip(
-            "Custom base URL for Ollama server.\n"
-            "Leave empty to use the default: http://localhost:11434"
+            "Base URL for Ollama server (no /api path — the app adds it automatically).\n\n"
+            "Default (prefilled): http://localhost:11434\n\n"
+            "Change only if you run Ollama on a different port or host.\n"
+            "If left empty, the default will be used automatically."
         )
         engine_form.addRow(self.ollama_server_url_label, self.ollama_server_url_edit)
 
@@ -2774,7 +2830,7 @@ class TranslatorApp(QMainWindow):
         sep_epub.setStyleSheet("color: #2e2e2e; margin: 4px 0;")
         alignment_section_layout.addWidget(sep_epub)
 
-        alignment_title_lbl = QLabel("🔡  Alignment Settings  (EPUB Legacy Mode only)")
+        alignment_title_lbl = QLabel("🔡  Alignment Settings  (Legacy Mode: EPUB, FB2, DOCX, MOBI, AZW3)")
         alignment_title_lbl.setStyleSheet(
             "color: #9977cc; font-size: 12px; font-weight: bold; margin-bottom: 2px;"
         )
@@ -2782,9 +2838,12 @@ class TranslatorApp(QMainWindow):
 
         alignment_desc = QLabel(
             "Automatically transfers inline tags (&lt;i&gt;, &lt;b&gt;, &lt;span&gt;, etc.) "
-            "from the original text to the translation using mBERT.<br>"
+            "from the original text to the translation using a multilingual encoder.<br>"
             "<span style='color: #666;'>Works only in LEGACY mode. "
-            "The model selection prompt appears when saving EPUB.</span>"
+            "The model selection prompt appears when saving EPUB, FB2 or DOCX.</span><br>"
+            "<span style='color: #aa7722;'>⭐ Default model "
+            "<b>microsoft/xlm-align-base</b> — best benchmark "
+            "(36/38, 94.7% span accuracy).</span>"
         )
         alignment_desc.setWordWrap(True)
         alignment_desc.setStyleSheet("color: #8877aa; font-size: 11px;")
@@ -2809,20 +2868,25 @@ class TranslatorApp(QMainWindow):
         alignment_form.addRow(align_label("Device:"), self.alignment_device_combo)
 
         self.alignment_model_edit = QLineEdit()
-        self.alignment_model_edit.setPlaceholderText("xlm-roberta-large")
+        self.alignment_model_edit.setPlaceholderText("microsoft/xlm-align-base")
         self.alignment_model_edit.setStyleSheet(INPUT_STYLE)
         self.alignment_model_edit.setToolTip(
             "Name of the model from HuggingFace Hub.\n"
             "These models are used ONLY for inline tag alignment in EPUB texts,\n"
             "i.e., to place <i>, <b>, <span> etc. in the correct position in the translated text.\n"
             "They do NOT perform translation or text generation.\n\n"
+            "⭐ DEFAULT (recommended): microsoft/xlm-align-base\n"
+            "   Best benchmark result: 36/38 span accuracy (94.7%)\n\n"
+            "Benchmark results (38 test cases, higher = better):\n"
+            "  microsoft/xlm-align-base      →  36/38  (94.7%)  ← DEFAULT / best\n"
+            "  microsoft/infoxlm-base        →  35/38  (92.1%)\n"
+            "  microsoft/mdeberta-v3-base    →  34/38  (89.5%)\n"
+            "  FacebookAI/xlm-roberta-base   →  33/38  (86.8%)\n"
+            "  microsoft/infoxlm-large       →  33/38  (86.8%)\n"
+            "  xlm-roberta-large             →  31/38  (81.6%)  (GPU recommended)\n\n"
             "Lightweight / CPU-friendly:\n"
-            "  bert-base-multilingual-cased        (~700 MB) – classic multilingual BERT\n"
-            "  microsoft/mdeberta-v3-base          (~1.0 GB) – multilingual encoder, CPU OK\n\n"
-            "Balanced / optional GPU:\n"
-            "  xlm-roberta-base                     (~1.1 GB) – strong multilingual embeddings\n\n"
-            "High-quality / GPU recommended:\n"
-            "  xlm-roberta-large                    (~2.4 GB) – top-quality multilingual embeddings\n\n"
+            "  bert-base-multilingual-cased  (~700 MB) – classic multilingual BERT\n"
+            "  microsoft/xlm-align-base      (~1.0 GB) – smallest of the top performers\n\n"
             "How it works:\n"
             "  The model computes semantic embeddings for each word in the original\n"
             "  and translated text, compares them to find word correspondences,\n"
@@ -2919,7 +2983,8 @@ class TranslatorApp(QMainWindow):
 
         autosave_desc = QLabel(
             "Save the auto-save session (.json) every N correctly translated fragments (no mismatch).\n"
-            "Set to 1 to save after every correct translation. Higher values reduce save frequency."
+            "Default is 10. Set to 1 to save after every correct translation. "
+            "Higher values reduce save frequency."
         )
         autosave_desc.setWordWrap(True)
         autosave_desc.setStyleSheet("color: #888888; font-size: 11px;")
@@ -2934,7 +2999,7 @@ class TranslatorApp(QMainWindow):
         self.auto_save_interval_spinbox = QSpinBox()
         self.auto_save_interval_spinbox.setRange(1, 100)
         self.auto_save_interval_spinbox.setSingleStep(1)
-        self.auto_save_interval_spinbox.setValue(self.app_settings.get('auto_save_interval', 1))
+        self.auto_save_interval_spinbox.setValue(self.app_settings.get('auto_save_interval', 10))
         self.auto_save_interval_spinbox.setFixedWidth(74)
         self.auto_save_interval_spinbox.setStyleSheet(SPINBOX_STYLE)
         self.auto_save_interval_spinbox.setToolTip(
@@ -2981,7 +3046,7 @@ class TranslatorApp(QMainWindow):
         self.llm_choice_combo.setCurrentText(current_llm)
         self.server_url_edit.setText(self.app_settings.get("server_url", ""))
         self.ollama_model_edit.setText(self.app_settings.get("ollama_model_name", ""))
-        self.ollama_server_url_edit.setText(self.app_settings.get("ollama_server_url", ""))
+        self.ollama_server_url_edit.setText(self.app_settings.get("ollama_server_url", "http://localhost:11434"))
         self.openrouter_api_key_edit.setText(self.app_settings.get("openrouter_api_key", ""))
         self.openrouter_model_edit.setText(self.app_settings.get("openrouter_model_name", ""))
         self.deepl_free_api_key_edit.setText(self.app_settings.get("deepl_free_api_key", ""))
@@ -2989,7 +3054,7 @@ class TranslatorApp(QMainWindow):
 
         alignment_cfg = self.app_settings.get("alignment_settings", {})
         self.alignment_device_combo.setCurrentText(alignment_cfg.get("device", "cpu"))
-        model_name_cfg = alignment_cfg.get("model_name", "xlm-roberta-large")
+        model_name_cfg = alignment_cfg.get("model_name", "microsoft/xlm-align-base")
         self.alignment_model_edit.setText(model_name_cfg)
         self._refresh_alignment_status(model_name_cfg)
 
@@ -3105,25 +3170,49 @@ class TranslatorApp(QMainWindow):
         self.update_llm_editor_content()
         self._update_status_after_file_load()
 
+    def _get_loaded_processing_mode(self) -> str:
+        """Return the effective processing mode of loaded paragraphs.
+
+        Uses the same logic as _get_current_variant: any legacy fragment
+        means the file was loaded in legacy mode. Elements without a
+        processing_mode field (images, book_title, etc.) are ignored so
+        that a cover image at index 0 cannot fake an 'inline' result.
+        """
+        modes = {
+            p.get('processing_mode')
+            for p in self.paragraphs
+            if p.get('processing_mode')
+        }
+        if 'legacy' in modes:
+            return 'legacy'
+        if 'inline' in modes:
+            return 'inline'
+        return 'inline'  # fallback: no tagged fragments at all
+
+    def _alignment_uses_extended_tags(self) -> bool:
+        return self.file_type in self._ALIGNMENT_EXTENDED_FORMATS
+
+    def _is_alignment_available(self) -> bool:
+        return any(
+            p.get('processing_mode') == 'legacy' and p.get('original_html')
+            for p in self.paragraphs
+        )
+
+    def _para_has_alignable_tags(self, para) -> bool:
+        original_html = para.get('original_html', '')
+        pattern = self._RE_ALIGN_EXTENDED if self._alignment_uses_extended_tags() else self._RE_ALIGN_INLINE
+        return bool(pattern.search(original_html))
+
     def _get_dot_for_para(self, para):
-        """
-        Return the alignment dot emoji for a paragraph, or None if not applicable.
-        Mirrors the logic in _update_item_visuals.
-        """
-        if para.get('processing_mode') != 'legacy':
+        if para.get('processing_mode') != 'legacy' or not para.get('original_html'):
             return None
         if not para.get('is_translated'):
             return None
-        original_html = para.get('original_html', '')
-        has_inline = any(
-            f'<{tag}' in original_html or f'<{tag}>' in original_html
-            for tag in INLINE_TRANSFER_TAGS
-        )
         if para.get('alignment_force_correct'):
             return '🟢'
         if para.get('alignment_force_bad'):
             return '🔴'
-        if not has_inline:
+        if not self._para_has_alignable_tags(para):
             return '⚫'
         if para.get('aligned_translated_html'):
             return '🟢' if para.get('alignment_auto_wrap') else (
@@ -3131,14 +3220,8 @@ class TranslatorApp(QMainWindow):
             )
         return '○'
 
-    def _get_paragraphs_for_epub_save(self, output_path):
-        """
-        For Legacy-mode EPUBs that have aligned fragments, show the alignment
-        filter dialog and return a (possibly filtered) copy of self.paragraphs.
-        Returns None if the user cancelled.
-        For non-legacy or un-aligned EPUBs returns self.paragraphs unchanged.
-        """
-        if not self._is_legacy_mode():
+    def _get_paragraphs_for_aligned_save(self, output_label):
+        if not self._is_alignment_available():
             return self.paragraphs
 
         counts = {}
@@ -3151,7 +3234,7 @@ class TranslatorApp(QMainWindow):
         if not any(d in counts for d in alignable):
             return self.paragraphs
 
-        dlg = AlignmentSaveDialog(counts, parent=self)
+        dlg = AlignmentSaveDialog(counts, output_label, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
 
@@ -3266,7 +3349,7 @@ class TranslatorApp(QMainWindow):
 
             if self.file_type == "epub":
                 if writer_output_format == "epub_native":
-                    paragraphs_to_save = self._get_paragraphs_for_epub_save(path)
+                    paragraphs_to_save = self._get_paragraphs_for_aligned_save("EPUB")
                     if paragraphs_to_save is None:
                         return
                     self.epub_creator = EPUBCreatorLxml(
@@ -3349,30 +3432,35 @@ class TranslatorApp(QMainWindow):
                     self.format_writer.finished.connect(self.on_file_saved)
                     self.format_writer.start()
             elif self.file_type in ("mobi", "fb2", "docx", "azw3"):
-                if writer_output_format == "epub":
-                    self.format_writer = EPUBWriter(
-                        self.paragraphs, path, source_title,
-                        image_resources=image_resources,
-                        source_format=src_fmt,
-                        css_class_styles=getattr(self.file_processor, 'css_class_styles', {}),
-                        tag_profile=tp
-                    )
-                elif writer_output_format == "fb2":
-                    self.format_writer = FB2Writer(
-                        self.paragraphs, path, source_title,
-                        image_resources=image_resources,
-                        source_format=src_fmt,
-                        tag_profile=tp
-                    )
-                elif writer_output_format == "docx":
-                    self.format_writer = DOCXWriter(
-                        self.paragraphs, path, source_title,
-                        image_resources=image_resources,
-                        source_format=src_fmt,
-                        tag_profile=tp
-                    )
-                elif writer_output_format == "txt":
+                if writer_output_format == "txt":
                     self.format_writer = TXTCreator(self.paragraphs, path, tag_profile=tp)
+                elif writer_output_format in ("epub", "fb2", "docx"):
+                    output_label = {"epub": "EPUB", "fb2": "FB2", "docx": "DOCX"}[writer_output_format]
+                    paragraphs_to_save = self._get_paragraphs_for_aligned_save(output_label)
+                    if paragraphs_to_save is None:
+                        return
+                    if writer_output_format == "epub":
+                        self.format_writer = EPUBWriter(
+                            paragraphs_to_save, path, source_title,
+                            image_resources=image_resources,
+                            source_format=src_fmt,
+                            css_class_styles=getattr(self.file_processor, 'css_class_styles', {}),
+                            tag_profile=tp
+                        )
+                    elif writer_output_format == "fb2":
+                        self.format_writer = FB2Writer(
+                            paragraphs_to_save, path, source_title,
+                            image_resources=image_resources,
+                            source_format=src_fmt,
+                            tag_profile=tp
+                        )
+                    else:
+                        self.format_writer = DOCXWriter(
+                            paragraphs_to_save, path, source_title,
+                            image_resources=image_resources,
+                            source_format=src_fmt,
+                            tag_profile=tp
+                        )
                 else:
                     return
                 self.format_writer.finished.connect(self.on_file_saved)
@@ -3636,12 +3724,19 @@ class TranslatorApp(QMainWindow):
 
             custom_prompts = {}
             if self.prompt_manager and variant:
-                prompts = self.prompt_manager.load_prompts_for_variant(variant)
+                if variant in self.current_prompts_cache:
+                    prompts = self.current_prompts_cache[variant]
+                else:
+                    prompts = self.prompt_manager.load_prompts_for_variant(variant)
                 custom_prompts = {
                     'ollama': prompts.get('ollama'),
                     'system': prompts.get('system'),
                     'assistant': prompts.get('assistant'),
-                    'user': prompts.get('user')
+                    'batch_assistant': prompts.get('batch_assistant'),
+                    'user': prompts.get('user'),
+                    'json_payload': prompts.get('json_payload'),
+                    'batch_json_payload': prompts.get('batch_json_payload'),
+                    'batch_hint': prompts.get('batch_hint'),
                 }
 
             processing_mode = 'inline' if self.app_settings.get('use_inline_formatting', True) else 'legacy'
@@ -3650,20 +3745,32 @@ class TranslatorApp(QMainWindow):
 
             json_payload_mode = self.json_payload_checkbox.isChecked()
             json_payload_template = ""
+            batch_json_payload_template = ""
             json_response_field = ""
+            json_payload_batch = False
 
             if json_payload_mode:
+                batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
+                json_payload_batch = batch_mode
                 if hasattr(self, 'json_payload_edit'):
-                    json_payload_template = self.json_payload_edit.toPlainText().strip()
+                    if batch_mode:
+                        batch_json_payload_template = self.json_payload_edit.toPlainText().strip()
+                    else:
+                        json_payload_template = self.json_payload_edit.toPlainText().strip()
                 elif variant and variant in self.current_prompts_cache:
-                    json_payload_template = self.current_prompts_cache[variant].get('json_payload', '')
-                else:
-                    json_payload_template = getattr(self, '_json_payload_content', '')
+                    if batch_mode:
+                        batch_json_payload_template = self.current_prompts_cache[variant].get('batch_json_payload', '')
+                    else:
+                        json_payload_template = self.current_prompts_cache[variant].get('json_payload', '')
                 json_response_field = self.json_response_field_edit.text().strip()
 
             source_lang = self.source_lang_combo.currentText() if hasattr(self, 'source_lang_combo') else ""
             target_lang = self.target_lang_combo.currentText() if hasattr(self, 'target_lang_combo') else ""
             quick_translate_service = self.quick_translate_service_combo.currentText() if hasattr(self, 'quick_translate_service_combo') else "Google (Free)"
+
+            tag_profile_dict = self.app_settings.get('tag_profile', {}) or {}
+            response_wrapper_tag = self.app_settings.get('response_wrapper_tag', 'translated')
+            source_format = self.source_format or ""
 
             SessionManager.save_session(
                 path=path,
@@ -3691,7 +3798,12 @@ class TranslatorApp(QMainWindow):
                 enable_thinking=self.thinking_checkbox.isChecked(),
                 source_lang=source_lang,
                 target_lang=target_lang,
-                quick_translate_service=quick_translate_service
+                quick_translate_service=quick_translate_service,
+                source_format=source_format,
+                tag_profile_dict=tag_profile_dict,
+                response_wrapper_tag=response_wrapper_tag,
+                batch_json_payload_template=batch_json_payload_template,
+                json_payload_batch=json_payload_batch,
             )
 
             self.show_message("Success", f"Session saved to file:\n{path}")
@@ -3706,7 +3818,7 @@ class TranslatorApp(QMainWindow):
         if not self.original_file_path:
             return
 
-        interval = self.app_settings.get('auto_save_interval', 1)
+        interval = self.app_settings.get('auto_save_interval', 10)
         self._auto_save_counter += 1
         if self._auto_save_counter < interval:
             return
@@ -3722,12 +3834,19 @@ class TranslatorApp(QMainWindow):
 
             custom_prompts = {}
             if self.prompt_manager and variant:
-                prompts = self.prompt_manager.load_prompts_for_variant(variant)
+                if variant in self.current_prompts_cache:
+                    prompts = self.current_prompts_cache[variant]
+                else:
+                    prompts = self.prompt_manager.load_prompts_for_variant(variant)
                 custom_prompts = {
                     'ollama': prompts.get('ollama'),
                     'system': prompts.get('system'),
                     'assistant': prompts.get('assistant'),
-                    'user': prompts.get('user')
+                    'batch_assistant': prompts.get('batch_assistant'),
+                    'user': prompts.get('user'),
+                    'json_payload': prompts.get('json_payload'),
+                    'batch_json_payload': prompts.get('batch_json_payload'),
+                    'batch_hint': prompts.get('batch_hint'),
                 }
 
             processing_mode = 'inline' if self.app_settings.get('use_inline_formatting', True) else 'legacy'
@@ -3736,20 +3855,32 @@ class TranslatorApp(QMainWindow):
 
             json_payload_mode = self.json_payload_checkbox.isChecked()
             json_payload_template = ""
+            batch_json_payload_template = ""
             json_response_field = ""
+            json_payload_batch = False
 
             if json_payload_mode:
+                batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
+                json_payload_batch = batch_mode
                 if hasattr(self, 'json_payload_edit'):
-                    json_payload_template = self.json_payload_edit.toPlainText().strip()
+                    if batch_mode:
+                        batch_json_payload_template = self.json_payload_edit.toPlainText().strip()
+                    else:
+                        json_payload_template = self.json_payload_edit.toPlainText().strip()
                 elif variant and variant in self.current_prompts_cache:
-                    json_payload_template = self.current_prompts_cache[variant].get('json_payload', '')
-                else:
-                    json_payload_template = getattr(self, '_json_payload_content', '')
+                    if batch_mode:
+                        batch_json_payload_template = self.current_prompts_cache[variant].get('batch_json_payload', '')
+                    else:
+                        json_payload_template = self.current_prompts_cache[variant].get('json_payload', '')
                 json_response_field = self.json_response_field_edit.text().strip()
 
             source_lang = self.source_lang_combo.currentText() if hasattr(self, 'source_lang_combo') else ""
             target_lang = self.target_lang_combo.currentText() if hasattr(self, 'target_lang_combo') else ""
             quick_translate_service = self.quick_translate_service_combo.currentText() if hasattr(self, 'quick_translate_service_combo') else "Google (Free)"
+
+            tag_profile_dict = self.app_settings.get('tag_profile', {}) or {}
+            response_wrapper_tag = self.app_settings.get('response_wrapper_tag', 'translated')
+            source_format = self.source_format or ""
 
             SessionManager.save_session(
                 path=save_path,
@@ -3777,7 +3908,12 @@ class TranslatorApp(QMainWindow):
                 enable_thinking=self.thinking_checkbox.isChecked(),
                 source_lang=source_lang,
                 target_lang=target_lang,
-                quick_translate_service=quick_translate_service
+                quick_translate_service=quick_translate_service,
+                source_format=source_format,
+                tag_profile_dict=tag_profile_dict,
+                response_wrapper_tag=response_wrapper_tag,
+                batch_json_payload_template=batch_json_payload_template,
+                json_payload_batch=json_payload_batch,
             )
 
         except Exception as e:
@@ -3804,13 +3940,18 @@ class TranslatorApp(QMainWindow):
                 return
 
             self.file_type = session_data['file_type']
-            cp = confirmed_path.lower()
-            if cp.endswith('.azw3'):
-                self.source_format = 'azw3'
-            elif cp.endswith('.azw'):
-                self.source_format = 'azw'
+
+            session_source_format = (session_data.get('source_format') or '').strip().lower()
+            if session_source_format:
+                self.source_format = session_source_format
             else:
-                self.source_format = self.file_type
+                cp = confirmed_path.lower()
+                if cp.endswith('.azw3'):
+                    self.source_format = 'azw3'
+                elif cp.endswith('.azw'):
+                    self.source_format = 'azw'
+                else:
+                    self.source_format = self.file_type
 
             self.paragraphs = session_data['paragraphs']
             self.original_file_path = confirmed_path
@@ -3821,19 +3962,44 @@ class TranslatorApp(QMainWindow):
             processing_mode = metadata.get('processing_mode', 'inline')
             use_inline = (processing_mode == 'inline')
 
-            skip_inline_tags = metadata.get('skip_inline_tags', {})
+            skip_inline_tags = metadata.get('skip_inline_tags', {}) or {}
+            session_tag_profile = metadata.get('tag_profile')
+            session_wrapper_tag = metadata.get('response_wrapper_tag')
 
             self.app_settings['use_inline_formatting'] = use_inline
             self.app_settings['skip_inline_tags'] = skip_inline_tags
+
+            if isinstance(session_tag_profile, dict) and session_tag_profile:
+                self.app_settings['tag_profile'] = dict(session_tag_profile)
+                if hasattr(self, 'tag_profile_edits'):
+                    for key, edit in self.tag_profile_edits.items():
+                        value = session_tag_profile.get(key)
+                        if isinstance(value, str) and value.strip():
+                            edit.blockSignals(True)
+                            edit.setText(value.strip())
+                            edit.blockSignals(False)
+
+            if isinstance(session_wrapper_tag, str) and session_wrapper_tag.strip():
+                self.app_settings['response_wrapper_tag'] = session_wrapper_tag.strip()
+                if hasattr(self, 'response_wrapper_tag_edit'):
+                    self.response_wrapper_tag_edit.blockSignals(True)
+                    self.response_wrapper_tag_edit.setText(session_wrapper_tag.strip())
+                    self.response_wrapper_tag_edit.blockSignals(False)
+
+            session_wrapper_variants = metadata.get('response_wrapper_tag_variants')
+            if isinstance(session_wrapper_variants, list) and session_wrapper_variants:
+                self.app_settings['response_wrapper_tag_variants'] = list(session_wrapper_variants)
+                self._set_wrapper_variants_in_ui(self.app_settings['response_wrapper_tag_variants'])
 
             self.context_before_spinbox.setValue(session_data.get('context_before', 3))
             self.context_after_spinbox.setValue(session_data.get('context_after', 2))
             self.temperature_spinbox.setValue(session_data.get('temperature', 0.8))
 
+            enable_thinking_value = session_data.get('enable_thinking', True)
             self.thinking_checkbox.blockSignals(True)
-            self.thinking_checkbox.setChecked(session_data.get('enable_thinking', True))
+            self.thinking_checkbox.setChecked(enable_thinking_value)
             self.thinking_checkbox.blockSignals(False)
-            self.app_settings['enable_thinking'] = session_data.get('enable_thinking', True)
+            self.app_settings['enable_thinking'] = enable_thinking_value
 
             if hasattr(self, 'sentence_batch_checkbox'):
                 self.sentence_batch_checkbox.setChecked(session_data.get('sentence_batch_enabled', False))
@@ -3887,40 +4053,32 @@ class TranslatorApp(QMainWindow):
             variant = self._get_current_variant()
             custom_prompts = session_data.get('custom_prompts', {})
 
-            if any(custom_prompts.values()):
-                self.current_prompts_cache[variant] = {}
+            if any(v for v in custom_prompts.values() if v):
+                if variant not in self.current_prompts_cache:
+                    self.current_prompts_cache[variant] = self.prompt_manager.load_prompts_for_variant(variant)
 
-                if custom_prompts.get('ollama'):
-                    self.current_prompts_cache[variant]['ollama'] = custom_prompts['ollama']
-                else:
-                    self.current_prompts_cache[variant]['ollama'] = self.prompt_manager.get_default_ollama_prompt(variant)
-
-                if custom_prompts.get('system'):
-                    self.current_prompts_cache[variant]['system'] = custom_prompts['system']
-                else:
-                    self.current_prompts_cache[variant]['system'] = self.prompt_manager.get_default_system_prompt(variant)
-
-                if custom_prompts.get('assistant'):
-                    self.current_prompts_cache[variant]['assistant'] = custom_prompts['assistant']
-                else:
-                    self.current_prompts_cache[variant]['assistant'] = self.prompt_manager.get_default_assistant_prompt(variant)
-
-                if custom_prompts.get('user'):
-                    self.current_prompts_cache[variant]['user'] = custom_prompts['user']
-                else:
-                    self.current_prompts_cache[variant]['user'] = self.prompt_manager.get_default_user_prompt(variant)
+                for role in ('ollama', 'system', 'assistant', 'batch_assistant',
+                             'user', 'json_payload', 'batch_json_payload', 'batch_hint'):
+                    val = custom_prompts.get(role)
+                    if val:
+                        self.current_prompts_cache[variant][role] = val
 
                 logger.info(f"Loaded custom prompts from session into cache: {variant}")
 
             json_payload_mode = session_data.get('json_payload_mode', False)
             json_payload_template = session_data.get('json_payload_template', '')
+            batch_json_payload_template = session_data.get('batch_json_payload_template', '')
             json_response_field = session_data.get('json_response_field', '')
 
-            if json_payload_mode and json_payload_template:
+            if json_payload_mode:
                 if variant not in self.current_prompts_cache:
                     self.current_prompts_cache[variant] = {}
-                self.current_prompts_cache[variant]['json_payload'] = json_payload_template
-                self._json_payload_content = json_payload_template
+
+                if json_payload_template:
+                    self.current_prompts_cache[variant]['json_payload'] = json_payload_template
+                    self._json_payload_content = json_payload_template
+                if batch_json_payload_template:
+                    self.current_prompts_cache[variant]['batch_json_payload'] = batch_json_payload_template
 
                 self.app_settings['json_response_field'] = json_response_field
 
@@ -3981,13 +4139,14 @@ class TranslatorApp(QMainWindow):
                         QMessageBox.Icon.Warning
                     )
 
-            elif self.file_type in ("mobi", "fb2", "docx"):
+            elif self.file_type in ("mobi", "fb2", "docx", "azw3"):
                 try:
                     logger.info(f"Loading {self.file_type.upper()} file to restore processor state...")
                     _, _ = self.file_processor.load(confirmed_path)
                     logger.info(f"✓ {self.file_type.upper()} processor state restored")
                 except Exception as e:
                     logger.error(f"Failed to restore {self.file_type.upper()} processor: {e}")
+                    traceback.print_exc()
                     self.show_message(
                         "Load Error",
                         f"Failed to reload {self.file_type.upper()} file:\n{e}\n\n"
@@ -4109,7 +4268,7 @@ class TranslatorApp(QMainWindow):
             enable_thinking = self.thinking_checkbox.isChecked()
 
             if llm_choice == "Ollama":
-                custom_url = self.app_settings.get('ollama_server_url', '').strip()
+                custom_url = self.app_settings.get('ollama_server_url', 'http://localhost:11434').strip()
                 llm_client = LLMClientFactory.create_client(
                     llm_choice="Ollama",
                     model_name=self.app_settings.get('ollama_model_name', 'llama3.2:3b'),
@@ -4124,7 +4283,7 @@ class TranslatorApp(QMainWindow):
                     enable_thinking=enable_thinking
                 )
             else:
-                custom_url = self.app_settings.get('server_url', '').strip()
+                custom_url = self.app_settings.get('server_url', 'http://localhost:1234/v1/chat/completions').strip()
                 llm_client = LLMClientFactory.create_client(
                     llm_choice="LM Studio",
                     endpoint=custom_url if custom_url else None,
@@ -4154,13 +4313,15 @@ class TranslatorApp(QMainWindow):
                 prompt_builder = PromptBuilder(
                     variant=variant,
                     json_payload_template=json_template,
-                    json_response_field=json_response_field
+                    json_response_field=json_response_field,
+                    tag_profile=self.tag_profile
                 )
             elif llm_choice == "Ollama":
                 prompt_builder = PromptBuilder(
                     variant=variant,
                     ollama_template=prompts['ollama'],
-                    single_prompt_mode=self.single_prompt_checkbox.isChecked()
+                    single_prompt_mode=self.single_prompt_checkbox.isChecked(),
+                    tag_profile=self.tag_profile
                 )
             else:
                 asst_template = prompts.get('batch_assistant', '') if batch_mode else prompts['assistant']
@@ -4169,7 +4330,8 @@ class TranslatorApp(QMainWindow):
                     system_template=prompts['system'],
                     assistant_template=asst_template,
                     user_template=prompts['user'],
-                    single_prompt_mode=self.single_prompt_checkbox.isChecked()
+                    single_prompt_mode=self.single_prompt_checkbox.isChecked(),
+                    tag_profile=self.tag_profile
                 )
 
             _split_fn = None
@@ -4183,6 +4345,7 @@ class TranslatorApp(QMainWindow):
                 timeout_minutes=self.timeout_spinbox.value(),
                 tag_profile=self.tag_profile,
                 response_wrapper_tag=self.app_settings.get('response_wrapper_tag', 'translated'),
+                response_wrapper_tag_variants=self.app_settings.get('response_wrapper_tag_variants', []),
                 split_fn=_split_fn
             )
 
@@ -4383,7 +4546,6 @@ class TranslatorApp(QMainWindow):
             batch_hint_template=batch_hint_template,
             top_p=top_p_val,
             top_k=top_k_val,
-            response_wrapper_tag=self.app_settings.get('response_wrapper_tag', 'translated')
         )
         self.current_worker.batch_progress.connect(self.on_batch_progress)
         self.current_worker.finished.connect(self.on_batch_finished)
@@ -4465,6 +4627,7 @@ class TranslatorApp(QMainWindow):
             current_idx = current_item.data(Qt.ItemDataRole.UserRole)
             if current_idx in indices:
                 self._refresh_llm_response_panel()
+                self._refresh_llm_prompt_panel()
 
         if not is_error and self._reader_window is not None:
             book = getattr(self.file_processor, 'book', None)
@@ -4775,6 +4938,7 @@ class TranslatorApp(QMainWindow):
             current_idx = current_item.data(Qt.ItemDataRole.UserRole)
             if current_idx == idx:
                 self._refresh_llm_response_panel()
+                self._refresh_llm_prompt_panel()
 
         if (
             hasattr(self, 'panel_tabs')
@@ -5004,28 +5168,20 @@ class TranslatorApp(QMainWindow):
 
         self._reset_cancel_button()
 
-    def _is_legacy_mode(self) -> bool:
-        return (
-            bool(self.paragraphs)
-            and self.paragraphs[0].get('processing_mode') == 'legacy'
-        )
-
     def _update_alignment_button_visibility(self):
-        """Show/hide btn_alignment and tabs based on file type and mode."""
-        is_legacy = self._is_legacy_mode()
-        is_epub   = self.file_type == 'epub'
+        is_available = self._is_alignment_available()
         preview_supported = self.file_type in ('epub', 'fb2', 'docx', 'mobi', 'pdf')
         if hasattr(self, 'btn_alignment'):
-            self.btn_alignment.setVisible(is_legacy)
+            self.btn_alignment.setVisible(is_available)
         if hasattr(self, 'panel_tabs'):
-            self.panel_tabs.setTabVisible(1, is_legacy)
+            self.panel_tabs.setTabVisible(1, is_available)
             self.panel_tabs.setTabVisible(2, preview_supported)
         if hasattr(self, '_alignment_filter_row'):
             on_alignment_tab = (
                 hasattr(self, 'panel_tabs')
                 and self.panel_tabs.currentIndex() == 1
             )
-            self._alignment_filter_row.setVisible(is_legacy and on_alignment_tab)
+            self._alignment_filter_row.setVisible(is_available and on_alignment_tab)
 
     def _update_alignment_tab(self, para_index):
         """Update the Alignment tab fields for the given paragraph index."""
@@ -5067,18 +5223,25 @@ class TranslatorApp(QMainWindow):
         self._update_item_visuals(idx)
 
     def start_alignment(self):
-        """Start alignment on selected, translated, non-mismatch paragraphs with inline tags."""
         models_dir = self._get_models_dir()
-        alignment_model = self.alignment_model_edit.text().strip() or 'xlm-roberta-large'
+        alignment_model = self.alignment_model_edit.text().strip() or 'microsoft/xlm-align-base'
 
         if not is_model_downloaded(alignment_model, models_dir):
-            self.show_message(
-                "Model Not Downloaded",
+            reply = QMessageBox.question(
+                self,
+                "Download Alignment Model",
                 f"The alignment model '{alignment_model}' is not available locally.\n\n"
-                "Please download it first in the Options tab → EPUB Settings → "
-                "Alignment Settings → Download / Check Model.",
-                QMessageBox.Icon.Warning
+                f"It will be downloaded to:\n"
+                f"{get_local_model_path(alignment_model, models_dir)}\n\n"
+                f"This may take several minutes and requires an internet connection.\n\n"
+                f"Download now and continue with alignment?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
             )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self._pending_alignment_after_download = True
+            self._on_download_alignment_model()
             return
 
         eligible = []
@@ -5088,15 +5251,13 @@ class TranslatorApp(QMainWindow):
                 continue
             idx = item.data(Qt.ItemDataRole.UserRole)
             para = self.paragraphs[idx]
+            if para.get('processing_mode') != 'legacy' or not para.get('original_html'):
+                continue
             if not para.get('is_translated'):
                 continue
             if para.get('has_mismatch'):
                 continue
-            original_html = para.get('original_html', '')
-            has_inline = any(
-                f'<{tag}' in original_html for tag in INLINE_TRANSFER_TAGS
-            )
-            if not has_inline:
+            if not self._para_has_alignable_tags(para):
                 continue
             eligible.append(para)
 
@@ -5130,6 +5291,7 @@ class TranslatorApp(QMainWindow):
             model_name=alignment_model,
             device=device,
             models_dir=models_dir,
+            extended_tags=self._alignment_uses_extended_tags(),
         )
         self._alignment_worker.progress.connect(self._on_alignment_progress)
         self._alignment_worker.finished.connect(self._on_alignment_finished)
@@ -5196,7 +5358,6 @@ class TranslatorApp(QMainWindow):
 
 
     def _on_panel_tab_changed(self, index: int):
-        """Handle switching between Translation (0), Alignment (1) and Preview (2) tabs."""
         is_alignment_tab = (index == 1)
         is_preview_tab   = (index == 2)
         hide_translation_controls = is_alignment_tab or is_preview_tab
@@ -5216,7 +5377,7 @@ class TranslatorApp(QMainWindow):
                 widget.setVisible(not hide_translation_controls)
 
         if hasattr(self, '_alignment_filter_row'):
-            show_filter = is_alignment_tab and self._is_legacy_mode()
+            show_filter = is_alignment_tab and self._is_alignment_available()
             self._alignment_filter_row.setVisible(show_filter)
             if not is_alignment_tab:
                 self._filter_alignment_dot(None)
@@ -5423,6 +5584,7 @@ class TranslatorApp(QMainWindow):
         self._update_alignment_tab(idx)
         self._update_translation_field_state(self.paragraphs[idx])
         self._refresh_llm_response_panel()
+        self._refresh_llm_prompt_panel()
 
         self.refresh_preview()
 
@@ -5503,6 +5665,7 @@ class TranslatorApp(QMainWindow):
                 self._update_alignment_tab(para_index)
                 self._update_translation_field_state(selected_para)
                 self._refresh_llm_response_panel()
+                self._refresh_llm_prompt_panel()
 
         self._preview_show_original_ids.clear()
         self.refresh_preview(selected_para)
@@ -5728,10 +5891,9 @@ class TranslatorApp(QMainWindow):
         return self.para_to_row_map.get(para_index, None)
 
     def _update_translation_field_state(self, para: dict) -> None:
-        """Update the Translation tab label and editability based on alignment state."""
         is_aligned = bool(
-            self.file_type == 'epub'
-            and para.get('processing_mode') == 'legacy'
+            para.get('processing_mode') == 'legacy'
+            and para.get('original_html')
             and para.get('aligned_translated_html')
         )
         if is_aligned:
@@ -5766,6 +5928,7 @@ class TranslatorApp(QMainWindow):
         self._update_alignment_tab(idx)
         self._update_translation_field_state(self.paragraphs[idx])
         self._refresh_llm_response_panel()
+        self._refresh_llm_prompt_panel()
 
         if hasattr(self, 'panel_tabs') and self.panel_tabs.currentIndex() == 2:
             self.refresh_preview()
@@ -5788,6 +5951,7 @@ class TranslatorApp(QMainWindow):
         self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
         self._update_alignment_tab(idx)
         self._update_translation_field_state(self.paragraphs[idx])
+        self._refresh_llm_prompt_panel()
 
         if hasattr(self, 'panel_tabs') and self.panel_tabs.currentIndex() == 2:
             self.refresh_preview()
@@ -5851,30 +6015,8 @@ class TranslatorApp(QMainWindow):
         if len(preview_text) > 70:
             preview_text = preview_text[:67] + '...'
 
-        alignment_dot = ''
-        if (self.file_type == 'epub'
-                and para.get('processing_mode') == 'legacy'
-                and para.get('is_translated')):
-            original_html = para.get('original_html', '')
-            has_inline_tags = any(
-                f'<{tag}' in original_html or f'<{tag}>' in original_html
-                for tag in INLINE_TRANSFER_TAGS
-            )
-            if para.get('alignment_force_correct'):
-                alignment_dot = '🟢 '
-            elif para.get('alignment_force_bad'):
-                alignment_dot = '🔴 '
-            elif not has_inline_tags:
-                alignment_dot = '⚫ '
-            elif para.get('aligned_translated_html'):
-                if para.get('alignment_auto_wrap'):
-                    alignment_dot = '🟢 '
-                else:
-                    corrections = para.get('alignment_corrections', 0)
-                    if corrections >= 2:
-                        alignment_dot = '🟠 '
-                    else:
-                        alignment_dot = '🟡 '
+        dot = self._get_dot_for_para(para)
+        alignment_dot = f'{dot} ' if dot and dot != '○' else ''
 
         item.setText(f"[{number}] {alignment_dot}{preview_text}")
 
@@ -6260,10 +6402,7 @@ class TranslatorApp(QMainWindow):
             return
 
         if self.file_type == "epub":
-            if self.paragraphs:
-                loaded_mode = self.paragraphs[0].get('processing_mode', 'inline')
-            else:
-                loaded_mode = 'inline'
+            loaded_mode = self._get_loaded_processing_mode()
 
             checkbox_mode = 'inline' if self.inline_formatting_checkbox.isChecked() else 'legacy'
 
@@ -6298,9 +6437,7 @@ class TranslatorApp(QMainWindow):
         self.btn_save_llm_instruction.setVisible(has_file)
 
         if self.llm_editor_container.isVisible():
-            llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
-            is_ollama = llm_choice == "Ollama"
-            self.single_prompt_checkbox.setVisible(has_file and not is_ollama)
+            self._update_single_prompt_checkbox_state()
 
         if has_file:
             filename = os.path.basename(self.original_file_path)
@@ -6351,7 +6488,7 @@ class TranslatorApp(QMainWindow):
             ]
 
             if self.file_type == "epub" and self.paragraphs:
-                loaded_mode = self.paragraphs[0].get('processing_mode', 'inline')
+                loaded_mode = self._get_loaded_processing_mode()
                 checkbox_mode = 'inline' if self.inline_formatting_checkbox.isChecked() else 'legacy'
 
                 tooltip_parts.append("")
@@ -6448,6 +6585,54 @@ class TranslatorApp(QMainWindow):
         raw = self.paragraphs[idx].get('llm_raw_response', '') or ''
         self.llm_response_view.setPlainText(raw)
 
+    def _format_llm_prompt(self, prompt) -> str:
+        if prompt is None:
+            return ''
+        if isinstance(prompt, str):
+            return prompt
+        if isinstance(prompt, dict) and '__json_payload__' in prompt:
+            return json.dumps(prompt['__json_payload__'], ensure_ascii=False, indent=2)
+        if isinstance(prompt, list):
+            blocks = []
+            for msg in prompt:
+                if isinstance(msg, dict):
+                    role = str(msg.get('role', 'unknown')).upper()
+                    content = msg.get('content', '')
+                    if not isinstance(content, str):
+                        content = json.dumps(content, ensure_ascii=False, indent=2)
+                    blocks.append(f"=== {role} ===\n{content}")
+                else:
+                    blocks.append(str(msg))
+            return "\n\n".join(blocks)
+        return str(prompt)
+
+    def _on_llm_prompt_toggled(self, checked: bool):
+        self.llm_prompt_container.setVisible(checked)
+        self.btn_llm_prompt_toggle.setText(
+            ("▼  " if checked else "▶  ") + "LLM Prompt"
+        )
+        if checked:
+            self._refresh_llm_prompt_panel()
+
+    def _refresh_llm_prompt_panel(self):
+        if not hasattr(self, 'llm_prompt_view'):
+            return
+        if not hasattr(self, 'llm_prompt_container'):
+            return
+        if not self.llm_prompt_container.isVisible():
+            return
+        current_item = self.list_widget.currentItem()
+        if not current_item:
+            self.llm_prompt_view.setPlainText('')
+            return
+        idx = current_item.data(Qt.ItemDataRole.UserRole)
+        if idx is None or idx >= len(self.paragraphs):
+            self.llm_prompt_view.setPlainText('')
+            return
+        self.llm_prompt_view.setPlainText(
+            self._format_llm_prompt(self.paragraphs[idx].get('llm_prompt'))
+        )
+
     def _parse_text_from_display(self, text: str) -> str:
         if not text or not self._show_ps_in_ui():
             return text
@@ -6455,10 +6640,6 @@ class TranslatorApp(QMainWindow):
         return text.replace('<ps>', '\n')
 
     def _filter_alignment_dot(self, dot: Optional[str]):
-        """Filter list to show only fragments with the given alignment dot colour.
-        dot values: '🟢','🟡','🟠','⚫','🔴','none', or None (show all).
-        Note: alignment_force_correct also maps to '🟢'.
-        """
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             idx = item.data(Qt.ItemDataRole.UserRole)
@@ -6468,37 +6649,13 @@ class TranslatorApp(QMainWindow):
                 item.setHidden(False)
                 continue
 
-            original_html = para.get('original_html', '')
-            has_inline_tags = any(
-                f'<{tag}' in original_html or f'<{tag}>' in original_html
-                for tag in INLINE_TRANSFER_TAGS
-            )
-            is_translated = para.get('is_translated', False)
-            is_legacy_epub = (
-                self.file_type == 'epub'
-                and para.get('processing_mode') == 'legacy'
-            )
-
-            if not is_legacy_epub or not is_translated:
+            current_dot = self._get_dot_for_para(para)
+            if current_dot is None:
                 item.setHidden(True)
                 continue
 
-            if para.get('alignment_force_correct'):
-                current_dot = '🟢'
-            elif para.get('alignment_force_bad'):
-                current_dot = '🔴'
-            elif not has_inline_tags:
-                current_dot = '⚫'
-            elif para.get('aligned_translated_html'):
-                if para.get('alignment_auto_wrap'):
-                    current_dot = '🟢'
-                else:
-                    corrections = para.get('alignment_corrections', 0)
-                    current_dot = '🟠' if corrections >= 2 else '🟡'
-            else:
-                current_dot = 'none'
-
-            item.setHidden(current_dot != dot)
+            key = 'none' if current_dot == '○' else current_dot
+            item.setHidden(key != dot)
 
     def filter_list(self, show_translated):
         for i in range(self.list_widget.count()):
@@ -7130,6 +7287,19 @@ class TranslatorApp(QMainWindow):
 
         return self.current_prompts_cache[variant]
 
+    def _update_thinking_checkbox_state(self):
+        has_file = bool(self.original_file_path)
+        self.thinking_checkbox.setEnabled(True)
+        self.thinking_checkbox.setVisible(has_file)
+
+    def _update_single_prompt_checkbox_state(self, llm_choice=None):
+        has_file = bool(self.original_file_path)
+        if llm_choice is None:
+            llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
+        is_ollama = llm_choice == "Ollama"
+        is_json = self.json_payload_checkbox.isChecked()
+        self.single_prompt_checkbox.setVisible(has_file and not is_ollama and not is_json)
+
     def toggle_llm_editor(self):
         is_visible = self.llm_editor_container.isVisible()
         self.llm_editor_container.setVisible(not is_visible)
@@ -7137,10 +7307,8 @@ class TranslatorApp(QMainWindow):
         if not is_visible:
             self.update_llm_editor_content()
             has_file = bool(self.original_file_path)
-            llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
-            is_ollama = llm_choice == "Ollama"
-            self.thinking_checkbox.setVisible(has_file)
-            self.single_prompt_checkbox.setVisible(has_file and not is_ollama)
+            self._update_thinking_checkbox_state()
+            self._update_single_prompt_checkbox_state()
             self.json_payload_checkbox.setVisible(has_file)
             is_json = self.json_payload_checkbox.isChecked()
             self.json_response_field_label.setVisible(has_file and is_json)
@@ -7158,8 +7326,8 @@ class TranslatorApp(QMainWindow):
         is_json = self.json_payload_checkbox.isChecked()
         is_single = self.single_prompt_checkbox.isChecked()
 
-        self.thinking_checkbox.setVisible(has_file)
-        self.single_prompt_checkbox.setVisible(has_file and not is_ollama and not is_json)
+        self._update_thinking_checkbox_state()
+        self._update_single_prompt_checkbox_state()
         self.json_payload_checkbox.setVisible(has_file)
         self.json_response_field_label.setVisible(has_file and is_json)
         self.json_response_field_edit.setVisible(has_file and is_json)
@@ -7185,10 +7353,19 @@ class TranslatorApp(QMainWindow):
             main_layout.setContentsMargins(0, 0, 0, 0)
             main_layout.setSpacing(4)
 
+            tp = self.tag_profile
+            core_var = '{' + tp.core_text_var + '}'
+            before_var = '{' + tp.context_before_var + '}'
+            after_var = '{' + tp.context_after_var + '}'
+
             if batch_mode:
-                info_label = QLabel("JSON Payload Template (Batch mode)  —  available variable: {core_text}  (context disabled in batch)")
+                info_label = QLabel(
+                    f"JSON Payload Template (Batch mode)  —  available variable: {core_var}  (context disabled in batch)"
+                )
             else:
-                info_label = QLabel("JSON Payload Template  —  available variables: {core_text}  {context_before}  {context_after}")
+                info_label = QLabel(
+                    f"JSON Payload Template  —  available variables: {core_var}  {before_var}  {after_var}"
+                )
             info_label.setStyleSheet("font-weight: bold; color: #cc8800;")
             main_layout.addWidget(info_label)
 
@@ -7492,13 +7669,8 @@ class TranslatorApp(QMainWindow):
         is_json = bool(state)
         self.json_response_field_label.setVisible(is_json)
         self.json_response_field_edit.setVisible(is_json)
-        if is_json:
-            self.single_prompt_checkbox.setVisible(False)
-        else:
-            has_file = bool(self.original_file_path)
-            llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
-            is_ollama = llm_choice == "Ollama"
-            self.single_prompt_checkbox.setVisible(has_file and not is_ollama)
+        self._update_thinking_checkbox_state()
+        self._update_single_prompt_checkbox_state()
         if self.llm_editor_container.isVisible():
             self.update_llm_editor_content()
         self._update_context_visibility()
@@ -7761,9 +7933,9 @@ class TranslatorApp(QMainWindow):
             "The parser uses these tags to mark reserve elements, inline formatting, "
             "non-translatable markers, paragraph boundaries, and batch boundaries.<br><br>"
             "<span style='color: #b8902a;'><b>Change these only if your LLM mangles the defaults.</b> "
-            "After saving, reload the file AND update your prompt files (.txt) "
-            "so the LLM is told to use the same tags. Already translated fragments "
-            "and saved sessions keep the old tags.</span>"
+            "After saving, reload the file. Your saved prompts (.txt files and the open editor) "
+            "and the factory defaults are renamed to the new tags automatically. "
+            "Already translated fragments and saved sessions keep the old tags.</span>"
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: #888888; font-size: 11px;")
@@ -7779,7 +7951,8 @@ class TranslatorApp(QMainWindow):
         wrapper_desc = QLabel(
             "XML tag the LLM uses to wrap its translation in the reply.<br>"
             "<span style='color: #666;'>The parser accepts both the configured tag "
-            "and the defaults <b>translated</b> / <b>translation</b> as fallback.</span>"
+            "and the defaults <b>translated</b> / <b>translation</b> as fallback, "
+            "plus any additional variants listed below.</span>"
         )
         wrapper_desc.setWordWrap(True)
         wrapper_desc.setStyleSheet("color: #888888; font-size: 11px;")
@@ -7792,7 +7965,8 @@ class TranslatorApp(QMainWindow):
         wrapper_lbl.setStyleSheet("color: #aaaaaa; font-size: 12px;")
         wrapper_lbl.setToolTip(
             "Name of the XML tag the LLM is instructed to use as the wrapper.\n\n"
-            "Allowed: letters, digits, underscore, hyphen. Must start with a letter.\n"
+            "Allowed: letters of any language, digits, underscore, hyphen.\n"
+            "Must start with a letter. No spaces.\n"
             "Leave empty to use the default."
         )
         wrapper_row.addWidget(wrapper_lbl)
@@ -7818,13 +7992,12 @@ class TranslatorApp(QMainWindow):
             "  • Your model refuses to produce <translated>\n"
             "  • Your prompt uses a different wrapper tag (e.g., <result>, <output>)\n"
             "  • You want to visually distinguish this app's prompts\n\n"
-            "Allowed characters: letters, digits, underscore, hyphen.\n"
-            "Must start with a letter. Leave empty to use the default.\n\n"
+            "Allowed characters: letters of any language, digits, underscore, hyphen.\n"
+            "Must start with a letter. No spaces. Leave empty to use the default.\n\n"
             "IMPORTANT:\n"
-            "If you change this tag, you must ALSO update your prompt files (.txt)\n"
-            "so the LLM knows to use the new wrapper. Otherwise the LLM will keep\n"
-            "returning <translated> — the parser will still accept it via the\n"
-            "built-in fallback, so it's safe to leave them mismatched."
+            "When you save, the previous wrapper tag in your saved prompts is renamed\n"
+            "to the new one automatically, so the LLM is told to use it.\n"
+            "The parser still accepts <translated> and <translation> as a fallback."
         )
         wrapper_row.addWidget(self.response_wrapper_tag_edit)
 
@@ -7849,10 +8022,12 @@ class TranslatorApp(QMainWindow):
         wrapper_hint.setToolTip(
             "For safety, the parser always accepts the default tags <translated>\n"
             "and <translation> — even if you change the field above.\n\n"
-            "This means: if you change the tag but forget to update your prompts,\n"
+            "This means: if you change the tag but a prompt still asks for the old one,\n"
             "translations will still work (with a warning if the LLM uses the old tag)."
         )
         layout.addWidget(wrapper_hint)
+
+        layout.addWidget(self._build_wrapper_variants_widget())
 
         def _update_wrapper_preview(_text):
             raw = self.response_wrapper_tag_edit.text().strip()
@@ -7903,8 +8078,8 @@ class TranslatorApp(QMainWindow):
                     "  • The LLM drops or rewrites these placeholders\n"
                     "  • You want a more distinct marker\n\n"
                     "Good alternatives: r_, _ph_, _res_\n\n"
-                    "IMPORTANT: after changing, update your prompt .txt files\n"
-                    "and reload the current file so fragments are regenerated."
+                    "IMPORTANT: after changing, reload the current file so fragments\n"
+                    "are regenerated. Prompts are renamed automatically when you save."
                 ),
             ),
             (
@@ -7928,8 +8103,8 @@ class TranslatorApp(QMainWindow):
                     "  • The LLM drops opening or closing placeholders\n"
                     "  • You want a more distinct marker\n\n"
                     "Good alternatives: x_, _i_, _fmt_\n\n"
-                    "IMPORTANT: after changing, update your prompt .txt files\n"
-                    "and reload the current file so fragments are regenerated."
+                    "IMPORTANT: after changing, reload the current file so fragments\n"
+                    "are regenerated. Prompts are renamed automatically when you save."
                 ),
             ),
             (
@@ -7954,8 +8129,8 @@ class TranslatorApp(QMainWindow):
                     "    and moves/removes it\n"
                     "  • You want a more distinct marker\n\n"
                     "Good alternatives: n_, _skip_, _x_\n\n"
-                    "IMPORTANT: after changing, update your prompt .txt files\n"
-                    "and reload the current file so fragments are regenerated."
+                    "IMPORTANT: after changing, reload the current file so fragments\n"
+                    "are regenerated. Prompts are renamed automatically when you save."
                 ),
             ),
             (
@@ -7978,8 +8153,8 @@ class TranslatorApp(QMainWindow):
                     "Good alternatives: _p_, _br_, ///\n\n"
                     "Only used when 'Restore paragraph structure' is enabled\n"
                     "in the Paragraph Structure Restoration section.\n\n"
-                    "IMPORTANT: after changing, update your prompt .txt files\n"
-                    "and reload the current file so fragments are regenerated."
+                    "IMPORTANT: after changing, reload the current file so fragments\n"
+                    "are regenerated. Prompts are renamed automatically when you save."
                 ),
             ),
             (
@@ -8000,8 +8175,58 @@ class TranslatorApp(QMainWindow):
                     "  • You want something visually distinct\n\n"
                     "Good alternatives: _s_, _sep_, |||\n\n"
                     "Only used when sentence batching is enabled.\n\n"
-                    "IMPORTANT: after changing, update your prompt .txt files\n"
-                    "and reload the current file so fragments are regenerated."
+                    "IMPORTANT: after changing, reload the current file so fragments\n"
+                    "are regenerated. Prompts are renamed automatically when you save."
+                ),
+            ),
+        ]
+
+        variable_fields = [
+            (
+                'core_text_var',
+                'Text to translate variable',
+                defaults.core_text_var,
+                lambda v: '{' + v + '}',
+                (
+                    "Name of the variable replaced with the text to translate.\n\n"
+                    "In every prompt template (system, assistant, user, Ollama,\n"
+                    "JSON payload) the text {NAME} is replaced with the fragment\n"
+                    "that is being translated.\n\n"
+                    "Example: name core_text  →  {core_text}\n\n"
+                    "Allowed: letters, digits, underscore, hyphen. Must start with a letter.\n"
+                    "Leave empty to use the default.\n\n"
+                    "IMPORTANT: prompts are updated automatically when you save —\n"
+                    "the old name in your saved prompts is replaced with the new one."
+                ),
+            ),
+            (
+                'context_before_var',
+                'Context before variable',
+                defaults.context_before_var,
+                lambda v: '{' + v + '}',
+                (
+                    "Name of the variable replaced with the paragraphs that\n"
+                    "precede the fragment (reference context only).\n\n"
+                    "Example: name context_before  →  {context_before}\n\n"
+                    "Allowed: letters, digits, underscore, hyphen. Must start with a letter.\n"
+                    "Leave empty to use the default.\n\n"
+                    "IMPORTANT: prompts are updated automatically when you save —\n"
+                    "the old name in your saved prompts is replaced with the new one."
+                ),
+            ),
+            (
+                'context_after_var',
+                'Context after variable',
+                defaults.context_after_var,
+                lambda v: '{' + v + '}',
+                (
+                    "Name of the variable replaced with the paragraphs that\n"
+                    "follow the fragment (reference context only).\n\n"
+                    "Example: name context_after  →  {context_after}\n\n"
+                    "Allowed: letters, digits, underscore, hyphen. Must start with a letter.\n"
+                    "Leave empty to use the default.\n\n"
+                    "IMPORTANT: prompts are updated automatically when you save —\n"
+                    "the old name in your saved prompts is replaced with the new one."
                 ),
             ),
         ]
@@ -8035,7 +8260,7 @@ class TranslatorApp(QMainWindow):
                     )
             return _update
 
-        for key, title, default, fmt, tooltip in fields:
+        def add_field(key, title, default, fmt, tooltip):
             row_title = QLabel(title + ":")
             row_title.setStyleSheet("color: #aaaaaa; font-size: 12px;")
             row_title.setToolTip(tooltip)
@@ -8066,11 +8291,38 @@ class TranslatorApp(QMainWindow):
             self.tag_profile_edits[key] = edit
             self.tag_profile_previews[key] = preview
 
+        for field in fields:
+            add_field(*field)
+
+        sep_vars = QFrame()
+        sep_vars.setFrameShape(QFrame.Shape.HLine)
+        sep_vars.setStyleSheet("color: #3a3a2a; margin: 6px 0;")
+        layout.addWidget(sep_vars)
+
+        variables_title = QLabel("📝  Prompt Template Variables")
+        variables_title.setStyleSheet(
+            "color: #b8902a; font-size: 12px; font-weight: bold; margin-bottom: 2px;"
+        )
+        layout.addWidget(variables_title)
+
+        variables_desc = QLabel(
+            "Names of the variables written in curly braces inside prompt templates. "
+            "They are replaced with the fragment to translate and with the surrounding context "
+            "before the request is sent to the LLM."
+        )
+        variables_desc.setWordWrap(True)
+        variables_desc.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(variables_desc)
+
+        for field in variable_fields:
+            add_field(*field)
+
         footer = QLabel(
             "⚠ After changing any tag above, remember to:<br>"
             "  1. Click <b>Save Settings</b> at the bottom of this tab<br>"
-            "  2. Reload the current file (Open File → same file)<br>"
-            "  3. Update your prompt files (.txt) so the LLM uses the same tags<br><br>"
+            "  2. Reload the current file (Open File → same file)<br><br>"
+            "Your saved prompts (system, assistant, user, Ollama, JSON payload, batch hint) "
+            "and the factory defaults are renamed to the new tags and variables automatically.<br>"
             "Already-translated fragments and saved sessions keep the old tags."
         )
         footer.setWordWrap(True)
@@ -8083,8 +8335,163 @@ class TranslatorApp(QMainWindow):
 
         return container
 
+    def _build_wrapper_variants_widget(self):
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(6)
+
+        title = QLabel("Additional parser variants:")
+        title.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+        title.setToolTip(
+            "Extra wrapper tag names the parser accepts in the LLM reply.\n\n"
+            "Use this when your model sometimes answers with a different tag,\n"
+            "for example <result> or <output>, even though the prompt asks for\n"
+            "the main wrapper tag.\n\n"
+            "Variants are used by the parser only. Prompts are never changed,\n"
+            "so adding or removing a variant needs no file reload."
+        )
+        layout.addWidget(title)
+
+        desc = QLabel(
+            "Tag names the parser also accepts in replies. They are used only for "
+            "reading the LLM output; prompts keep asking for the main wrapper tag."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(desc)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self.wrapper_variant_edit = QLineEdit()
+        self.wrapper_variant_edit.setPlaceholderText("e.g. result")
+        self.wrapper_variant_edit.setFixedWidth(180)
+        self.wrapper_variant_edit.setStyleSheet("""
+            QLineEdit {
+                background-color: #161616; color: #e0e0e0;
+                border: 1px solid #2e2e2e; border-radius: 3px;
+                padding: 5px 8px; font-size: 12px;
+            }
+            QLineEdit:focus { border-color: #2a6aaa; }
+        """)
+        self.wrapper_variant_edit.setToolTip(
+            "Tag name to add, without angle brackets.\n\n"
+            "Allowed: letters of any language (e.g. traduit, перевод, 翻訳), digits,\n"
+            "underscore, hyphen. Must start with a letter. No spaces."
+        )
+        self.wrapper_variant_edit.returnPressed.connect(self._add_wrapper_variant)
+        row.addWidget(self.wrapper_variant_edit)
+
+        small_btn_style = """
+            QPushButton {
+                background-color: #252525;
+                color: #bbbbbb;
+                border: 1px solid #3c3c3c;
+                border-radius: 3px;
+                padding: 4px 8px;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #333; color: white; border-color: #555; }
+            QPushButton:pressed { background-color: #1a1a1a; }
+        """
+
+        add_btn = QPushButton("Add")
+        add_btn.setStyleSheet(small_btn_style)
+        add_btn.clicked.connect(self._add_wrapper_variant)
+        row.addWidget(add_btn)
+
+        remove_btn = QPushButton("Remove selected")
+        remove_btn.setStyleSheet(small_btn_style)
+        remove_btn.clicked.connect(self._remove_wrapper_variant)
+        row.addWidget(remove_btn)
+
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.wrapper_variants_list = QListWidget()
+        self.wrapper_variants_list.setFixedHeight(90)
+        self.wrapper_variants_list.setFixedWidth(280)
+        self.wrapper_variants_list.setStyleSheet("""
+            QListWidget {
+                background-color: #161616; color: #e0e0e0;
+                border: 1px solid #2e2e2e; border-radius: 3px;
+                font-size: 12px;
+            }
+            QListWidget::item:selected { background-color: #2a4a6a; color: white; }
+        """)
+        self.wrapper_variants_list.setToolTip(
+            "Additional wrapper tag names accepted by the parser.\n"
+            "Select an entry and click 'Remove selected' to delete it.\n"
+            "Changes take effect after clicking Save Settings."
+        )
+        layout.addWidget(self.wrapper_variants_list)
+
+        self._set_wrapper_variants_in_ui(self.app_settings.get('response_wrapper_tag_variants', []))
+
+        return container
+
+    def _get_wrapper_variants_from_ui(self) -> List[str]:
+        widget = getattr(self, 'wrapper_variants_list', None)
+        if widget is None:
+            return list(self.app_settings.get('response_wrapper_tag_variants', []) or [])
+        return [widget.item(i).text() for i in range(widget.count())]
+
+    def _set_wrapper_variants_in_ui(self, variants) -> None:
+        widget = getattr(self, 'wrapper_variants_list', None)
+        if widget is None:
+            return
+        widget.clear()
+        for name in variants or []:
+            widget.addItem(name)
+
+    def _add_wrapper_variant(self) -> None:
+        edit = getattr(self, 'wrapper_variant_edit', None)
+        if edit is None or getattr(self, 'wrapper_variants_list', None) is None:
+            return
+
+        name = edit.text().strip()
+        if not name:
+            return
+
+        if not is_valid_wrapper_variant_name(name):
+            QMessageBox.warning(
+                self, "Invalid Variant",
+                f"'{name}' is not a valid tag name.\n\n"
+                f"Allowed: letters of any language, digits, underscore, hyphen. "
+                f"Must start with a letter. No spaces or characters < > / & = quotes."
+            )
+            return
+
+        primary = ''
+        if hasattr(self, 'response_wrapper_tag_edit'):
+            primary = self.response_wrapper_tag_edit.text().strip()
+        primary = primary or 'translated'
+
+        existing = normalize_wrapper_variants(self._get_wrapper_variants_from_ui(), primary)
+        updated = normalize_wrapper_variants(existing + [name], primary)
+        if len(updated) == len(existing):
+            QMessageBox.information(
+                self, "Variant Already Accepted",
+                f"'{name}' is already accepted by the parser. It is either the main wrapper tag, "
+                f"one of the default fallbacks (translated, translation), or already on the list."
+            )
+            return
+
+        self._set_wrapper_variants_in_ui(updated)
+        edit.clear()
+
+    def _remove_wrapper_variant(self) -> None:
+        widget = getattr(self, 'wrapper_variants_list', None)
+        if widget is None:
+            return
+        for item in widget.selectedItems():
+            widget.takeItem(widget.row(item))
+
     def save_app_settings(self):
         try:
+            old_prompt_profile = PromptManager.resolve_prompt_profile(self.app_settings)
             settings = self.app_settings.copy()
             settings["llm_choice"] = self.llm_choice_combo.currentText()
             settings["server_url"] = self.server_url_edit.text().strip()
@@ -8104,15 +8511,15 @@ class TranslatorApp(QMainWindow):
             raw_wrapper = self.response_wrapper_tag_edit.text().strip() if hasattr(self, 'response_wrapper_tag_edit') else ''
             if not raw_wrapper:
                 raw_wrapper = 'translated'
-            if not re.match(r'^[A-Za-z][A-Za-z0-9_\-]*$', raw_wrapper):
+            if not is_valid_wrapper_variant_name(raw_wrapper):
                 QMessageBox.warning(
                     self, "Invalid Wrapper Tag",
                     f"'{raw_wrapper}' is not a valid tag name. "
                     f"Using 'translated' instead.\n\n"
-                    f"Allowed: letters, digits, underscore, hyphen. Must start with a letter."
+                    f"Allowed: letters of any language, digits, underscore, hyphen. "
+                    f"Must start with a letter. No spaces or characters < > / & = quotes."
                 )
                 raw_wrapper = 'translated'
-            settings["response_wrapper_tag"] = raw_wrapper
 
             tag_defaults_obj = TagProfile()
             tag_defaults = {
@@ -8121,7 +8528,22 @@ class TranslatorApp(QMainWindow):
                 "non_trans_prefix": tag_defaults_obj.non_trans_prefix,
                 "paragraph_separator": tag_defaults_obj.paragraph_separator,
                 "batch_separator": tag_defaults_obj.batch_separator,
+                "core_text_var": tag_defaults_obj.core_text_var,
+                "context_before_var": tag_defaults_obj.context_before_var,
+                "context_after_var": tag_defaults_obj.context_after_var,
             }
+            tag_keys = (
+                "reserve_prefix",
+                "inline_prefix",
+                "non_trans_prefix",
+                "paragraph_separator",
+                "batch_separator",
+            )
+            variable_keys = (
+                "core_text_var",
+                "context_before_var",
+                "context_after_var",
+            )
             tag_valid_re = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]*$')
             tag_values = {}
             invalid_fields = []
@@ -8143,12 +8565,56 @@ class TranslatorApp(QMainWindow):
                     + "\n\nAllowed: letters, digits, underscore, hyphen. Must start with a letter."
                 )
 
-            if len(set(tag_values.values())) != len(tag_values):
+            if len({tag_values[k] for k in tag_keys}) != len(tag_keys):
                 QMessageBox.warning(
                     self, "Duplicate Tag Names",
-                    "All five tag names must be different. Default tag profile will be used."
+                    "All five tag names must be different. Default tag names will be used."
                 )
-                tag_values = dict(tag_defaults)
+                for k in tag_keys:
+                    tag_values[k] = tag_defaults[k]
+
+            if len({tag_values[k] for k in variable_keys}) != len(variable_keys):
+                QMessageBox.warning(
+                    self, "Duplicate Variable Names",
+                    "All three template variable names must be different. Default variable names will be used."
+                )
+                for k in variable_keys:
+                    tag_values[k] = tag_defaults[k]
+
+            reserved_wrapper_names = {
+                tag_values["paragraph_separator"],
+                tag_values["batch_separator"],
+            }
+            if raw_wrapper in reserved_wrapper_names:
+                QMessageBox.warning(
+                    self, "Wrapper Tag Conflict",
+                    f"The response wrapper tag '{raw_wrapper}' must be different from the "
+                    f"paragraph separator and the batch separator.\n\n"
+                    f"Using 'translated' instead."
+                )
+                raw_wrapper = 'translated'
+                if raw_wrapper in reserved_wrapper_names:
+                    for k in ("paragraph_separator", "batch_separator"):
+                        tag_values[k] = tag_defaults[k]
+            settings["response_wrapper_tag"] = raw_wrapper
+            if hasattr(self, 'response_wrapper_tag_edit') and self.response_wrapper_tag_edit.text().strip() != raw_wrapper:
+                self.response_wrapper_tag_edit.setText(raw_wrapper)
+
+            cleaned_variants = normalize_wrapper_variants(self._get_wrapper_variants_from_ui(), raw_wrapper)
+            reserved_variant_names = {
+                tag_values["paragraph_separator"].lower(),
+                tag_values["batch_separator"].lower(),
+            }
+            conflicting_variants = [v for v in cleaned_variants if v.lower() in reserved_variant_names]
+            if conflicting_variants:
+                QMessageBox.warning(
+                    self, "Wrapper Variant Conflict",
+                    "These wrapper variants clash with the paragraph or batch separator "
+                    "and were removed:\n\n" + "\n".join(conflicting_variants)
+                )
+            wrapper_variants = [v for v in cleaned_variants if v.lower() not in reserved_variant_names]
+            settings["response_wrapper_tag_variants"] = wrapper_variants
+            self._set_wrapper_variants_in_ui(wrapper_variants)
 
             old_tag_profile = self.app_settings.get('tag_profile', {})
             tag_profile_changed = (old_tag_profile != tag_values)
@@ -8184,7 +8650,7 @@ class TranslatorApp(QMainWindow):
             }
             model_name_input = self.alignment_model_edit.text().strip()
             if not model_name_input:
-                model_name_input = "xlm-roberta-large"
+                model_name_input = "microsoft/xlm-align-base"
             settings["alignment_settings"] = {
                 "device":     self.alignment_device_combo.currentText(),
                 "model_name": model_name_input,
@@ -8194,20 +8660,59 @@ class TranslatorApp(QMainWindow):
                 f"enable_thinking: {settings['enable_thinking']}, "
                 f"restore_paragraph_structure: {settings['restore_paragraph_structure']}, "
                 f"response_wrapper_tag: {settings['response_wrapper_tag']}, "
+                f"response_wrapper_tag_variants: {settings['response_wrapper_tag_variants']}, "
                 f"tag_profile: {settings['tag_profile']}, "
                 f"alignment_settings: {settings['alignment_settings']}"
             )
-            AppSettingsManager.save_settings(settings)
+            new_prompt_profile = PromptManager.normalize_prompt_profile(
+                dict(tag_values, response_wrapper_tag=raw_wrapper)
+            )
+            prompt_profile_changed = (old_prompt_profile != new_prompt_profile)
+            settings["prompt_tag_profile"] = new_prompt_profile
+
+            migrated_files = []
+            if prompt_profile_changed:
+                migrated_files = PromptManager.migrate_prompt_files(
+                    old_prompt_profile, new_prompt_profile
+                )
+            try:
+                AppSettingsManager.save_settings(settings)
+            except Exception:
+                if migrated_files:
+                    try:
+                        PromptManager.migrate_prompt_files(new_prompt_profile, old_prompt_profile)
+                    except Exception as rollback_error:
+                        logger.error(f"Failed to roll back prompt files: {rollback_error}")
+                raise
+
+            if prompt_profile_changed:
+                self.current_prompts_cache = PromptManager.convert_prompt_cache(
+                    self.current_prompts_cache, old_prompt_profile, new_prompt_profile
+                )
+                self._json_payload_content = PromptManager.convert_prompt_text(
+                    getattr(self, '_json_payload_content', ''),
+                    old_prompt_profile,
+                    new_prompt_profile
+                )
+
             self.app_settings = settings
             self._initialize_components()
+            editor_visible = hasattr(self, 'llm_editor_container') and self.llm_editor_container.isVisible()
+            if editor_visible or (prompt_profile_changed and hasattr(self, 'llm_editor_layout')):
+                self.update_llm_editor_content()
             if new_quote_style != old_quote_style:
                 self._apply_quote_style_to_all_translated(new_quote_style)
             self._refresh_alignment_status(model_name_input)
 
             message = "Settings have been saved successfully."
+            if prompt_profile_changed:
+                message += (
+                    f"\n\nPrompt templates were updated to the new tag and variable names "
+                    f"({len(migrated_files)} saved prompt file(s) changed)."
+                )
             if tag_profile_changed and self.paragraphs:
                 message += (
-                    "\n\nThe tag profile changed. Reload the file (and update your prompt files) "
+                    "\n\nThe tag profile changed. Reload the file "
                     "so that fragments use the new tags."
                 )
             QMessageBox.information(self, "Settings Saved", message)
@@ -8218,7 +8723,7 @@ class TranslatorApp(QMainWindow):
     def _on_download_alignment_model(self) -> None:
         model_name = self.alignment_model_edit.text().strip()
         if not model_name:
-            model_name = "xlm-roberta-large"
+            model_name = "microsoft/xlm-align-base"
 
         models_dir = self._get_models_dir()
 
@@ -8296,10 +8801,15 @@ class TranslatorApp(QMainWindow):
                 "Check your internet connection and make sure the "
                 "'transformers' package is installed.",
             )
+            self._pending_alignment_after_download = False
         else:
             logger.info(f"[app] Model '{model_name}' downloaded to: {saved_path}")
 
             self._refresh_alignment_status(model_name)
+
+            if getattr(self, '_pending_alignment_after_download', False):
+                self._pending_alignment_after_download = False
+                QTimer.singleShot(0, self.start_alignment)
 
     def update_model_name_visibility(self, llm_choice):
         is_ollama     = llm_choice == "Ollama"
@@ -8318,10 +8828,8 @@ class TranslatorApp(QMainWindow):
         self.openrouter_model_edit.setVisible(is_openrouter)
         self.openrouter_free_warning.setVisible(is_openrouter)
 
-        has_file = bool(self.original_file_path)
-        is_json = self.json_payload_checkbox.isChecked()
-        self.thinking_checkbox.setVisible(has_file)
-        self.single_prompt_checkbox.setVisible(has_file and not is_ollama and not is_json)
+        self._update_thinking_checkbox_state()
+        self._update_single_prompt_checkbox_state(llm_choice)
 
     def _toggle_processing_mode(self, checked):
         new_mode = 'inline' if checked else 'legacy'
@@ -8344,10 +8852,7 @@ class TranslatorApp(QMainWindow):
 
         translated_count = sum(1 for p in self.paragraphs if p.get('is_translated', False))
 
-        if self.paragraphs:
-            loaded_mode = self.paragraphs[0].get('processing_mode', 'inline')
-        else:
-            loaded_mode = 'inline'
+        loaded_mode = self._get_loaded_processing_mode()
 
         if new_mode == loaded_mode:
             logger.debug(f"Checkbox changed but matches loaded mode: {new_mode}")
@@ -8496,7 +9001,7 @@ class TranslatorApp(QMainWindow):
             if hasattr(self, 'alignment_model_edit'):
                 model_name = self.alignment_model_edit.text().strip()
         if not model_name:
-            model_name = "xlm-roberta-large"
+            model_name = "microsoft/xlm-align-base"
 
         models_dir = self._get_models_dir()
 
@@ -8505,17 +9010,20 @@ class TranslatorApp(QMainWindow):
         except Exception:
             downloaded = False
 
+        is_default = (model_name == 'microsoft/xlm-align-base')
+        default_suffix = " (DEFAULT — best benchmark: 94.7%)" if is_default else ""
+
         if downloaded:
             local_path = get_local_model_path(model_name, models_dir)
             self.alignment_status_label.setText(
-                f"✓ Model available locally: {local_path}"
+                f"✓ Model available locally{default_suffix}: {local_path}"
             )
             self.alignment_status_label.setStyleSheet(
                 "color: #44aa44; font-size: 10px;"
             )
         else:
             self.alignment_status_label.setText(
-                f"Model '{model_name}' not found locally. "
+                f"Model '{model_name}'{default_suffix} not found locally. "
                 "Click 'Download' to fetch it (one-time)."
             )
             self.alignment_status_label.setStyleSheet(
@@ -8579,11 +9087,10 @@ class TranslatorApp(QMainWindow):
             variant = "epub_inline" if use_inline else "epub_legacy"
             logger.debug(f"Current variant: {variant} (checkbox: {use_inline})")
             return variant
-        elif self.file_type in ("mobi", "fb2", "docx"):
+        elif self.file_type in ("mobi", "fb2", "docx", "azw3"):
             if not self.paragraphs:
                 return "txt"
-            first_mode = self.paragraphs[0].get('processing_mode', 'inline')
-            if first_mode == 'legacy':
+            if any(p.get('processing_mode') == 'legacy' for p in self.paragraphs):
                 return "epub_legacy"
             has_inline = any(p.get('inline_formatting_map') for p in self.paragraphs)
             return "epub_inline" if has_inline else "txt"
