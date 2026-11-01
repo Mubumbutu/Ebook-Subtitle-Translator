@@ -2,7 +2,7 @@
 import logging
 import re
 from typing import Dict, List, Optional, Tuple
-from app_utils import TagProfile
+from app_utils import TagProfile, normalize_wrapper_variants, wrapper_tag_names
 
 logger = logging.getLogger(__name__)
 
@@ -1093,7 +1093,8 @@ class FormattingSynchronizer:
         file_type: str,
         quote_style: str = 'neutral',
         response_wrapper_tag: str = 'translated',
-        tag_profile: Optional[TagProfile] = None
+        tag_profile: Optional[TagProfile] = None,
+        response_wrapper_tag_variants: Optional[List[str]] = None
     ):
         self.file_type = file_type
         self.quote_style = quote_style
@@ -1101,6 +1102,10 @@ class FormattingSynchronizer:
         self._quote_open: str = pair[0]
         self._quote_close: str = pair[1]
         self.response_wrapper_tag = (response_wrapper_tag or 'translated').strip() or 'translated'
+        self.response_wrapper_tag_variants = normalize_wrapper_variants(
+            response_wrapper_tag_variants,
+            self.response_wrapper_tag
+        )
         self.tag_profile = tag_profile or TagProfile()
 
     def sync_formatting(
@@ -1157,15 +1162,14 @@ class FormattingSynchronizer:
         leading_ws  = text[:len(text) - len(text.lstrip())]
         trailing_ws = text[len(text.rstrip()):]
 
-        custom_tag = self.response_wrapper_tag
-        custom_variants = {
-            custom_tag,
-            custom_tag.upper(),
-            custom_tag.lower(),
-            custom_tag.capitalize(),
-        }
-        standard_variants = {'translated', 'translation', 'TRANSLATED', 'TRANSLATION', 'Translated', 'Translation'}
-        all_variants = custom_variants | standard_variants
+        all_variants = set()
+        for tag_name in wrapper_tag_names(self.response_wrapper_tag, self.response_wrapper_tag_variants):
+            all_variants.update({
+                tag_name,
+                tag_name.upper(),
+                tag_name.lower(),
+                tag_name.capitalize(),
+            })
 
         OPENING_TAGS = [f'<{v}>' for v in all_variants]
         CLOSING_TAGS = [f'</{v}>' for v in all_variants]
