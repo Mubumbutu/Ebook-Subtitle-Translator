@@ -8,13 +8,10 @@ color 0A
 
 echo.
 echo ============================================================
-echo EPUB and SRT Translator - Bulletproof Installation
+echo EPUB and SRT Translator - Installation
 echo ============================================================
 echo.
 
-:: ============================================================
-:: PYTHON CHECK (3.10+)
-:: ============================================================
 echo [1/6] Checking Python...
 py -3 --version >nul 2>&1
 if errorlevel 1 (
@@ -45,9 +42,6 @@ if !PY_MAJOR! EQU 3 if !PY_MINOR! LSS 10 (
 echo [OK] Python !PY_NUM!
 echo.
 
-:: ============================================================
-:: CLEAN & CREATE VENV
-:: ============================================================
 set "VENV_DIR=venv"
 echo [2/6] Creating clean virtual environment...
 if exist "%VENV_DIR%" (
@@ -65,9 +59,6 @@ echo [OK] Virtual environment created.
 set "VENV_PY=%~dp0%VENV_DIR%\Scripts\python.exe"
 echo.
 
-:: ============================================================
-:: GPU DETECTION
-:: ============================================================
 echo [3/6] Detecting NVIDIA GPU...
 set GPU_FOUND=0
 set DRIVER_MAJOR=0
@@ -89,13 +80,10 @@ if !GPU_FOUND! EQU 1 (
 )
 echo.
 
-:: ============================================================
-:: USER CHOICE
-:: ============================================================
 echo Choose installation type:
 echo.
-echo [1] CPU only (works everywhere)
-echo [2] GPU (NVIDIA CUDA - recommended if you have GPU)
+echo [1] CPU only - works everywhere
+echo [2] GPU - NVIDIA CUDA, recommended if you have GPU
 echo.
 :CHOICE
 set USER_CHOICE=
@@ -105,17 +93,11 @@ if "%USER_CHOICE%"=="2" goto GPU_MODE
 echo Invalid choice. Try again.
 goto CHOICE
 
-:: ============================================================
-:: CPU MODE
-:: ============================================================
 :CPU_MODE
 set TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 set TORCH_VARIANT=CPU only
 goto INSTALL
 
-:: ============================================================
-:: GPU MODE
-:: ============================================================
 :GPU_MODE
 if !GPU_FOUND! EQU 0 (
     echo [WARNING] No NVIDIA GPU detected. Falling back to CPU.
@@ -139,17 +121,18 @@ if !DRIVER_MAJOR! GEQ 550 (
 )
 goto INSTALL
 
-:: ============================================================
-:: INSTALL
-:: ============================================================
 :INSTALL
 echo.
 echo [4/6] Selected: !TORCH_VARIANT!
 echo Index URL: !TORCH_INDEX_URL!
 echo.
 
-echo [5/6] Installing dependencies (without torch)...
+echo [5/6] Installing dependencies except torch...
 "%VENV_PY%" -m pip install --upgrade pip --quiet
+
+echo [INFO] Uninstalling existing PyQt6 packages to ensure clean install...
+"%VENV_PY%" -m pip uninstall -y PyQt6 PyQt6-Qt6 PyQt6-WebEngine PyQt6-WebEngine-Qt6 PyQt6-sip >nul 2>&1
+echo [OK] Old PyQt6 packages removed.
 
 echo import sys > _filter.py
 echo lines=open('requirements.txt').readlines() >> _filter.py
@@ -165,6 +148,13 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+"%VENV_PY%" -m pip uninstall -y hf-xet >nul 2>&1
+if errorlevel 1 (
+    echo [INFO] hf-xet was not present.
+) else (
+    echo [OK] hf-xet removed.
+)
 echo [OK] Base dependencies installed.
 
 echo.
@@ -177,9 +167,6 @@ if errorlevel 1 (
 )
 echo [OK] PyTorch installed.
 
-:: ============================================================
-:: VERIFICATION
-:: ============================================================
 echo.
 echo Verifying installation...
 echo.
