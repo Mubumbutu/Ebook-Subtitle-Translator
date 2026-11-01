@@ -2121,6 +2121,87 @@ class PDFProcessor(FileProcessor):
         return result
 
 
+def _build_legacy_original_html(element, element_id: str, css_class_styles: dict = None) -> str:
+    XHTML_NS = 'http://www.w3.org/1999/xhtml'
+    TAG_MAP = {
+        'b': 'b', 'strong': 'b', 'i': 'em', 'em': 'em', 'u': 'u',
+        's': 's', 'strike': 's', 'sub': 'sub', 'sup': 'sup',
+        'small': 'small', 'span': 'span', 'font': 'span', 'a': 'a',
+    }
+    FONT_SIZE_MAP = {
+        '1': '0.6em', '2': '0.8em', '3': '1em', '4': '1.2em',
+        '5': '1.5em', '6': '2em', '7': '2.5em',
+        '+1': '1.1em', '+2': '1.3em', '+3': '1.6em', '+4': '2em',
+        '-1': '0.85em', '-2': '0.7em',
+    }
+    KEEP_ATTRS = ('href', 'id', 'name', 'title', 'target', 'class')
+    KEEP_INLINE_PROPS = {
+        'font-size', 'font-weight', 'font-style', 'color',
+        'text-decoration', 'vertical-align', 'letter-spacing',
+        'float', 'line-height',
+    }
+
+    def _parse_style(raw):
+        result = {}
+        for decl in (raw or '').split(';'):
+            decl = decl.strip()
+            if ':' in decl:
+                prop, _, val = decl.partition(':')
+                result[prop.strip().lower()] = val.strip()
+        return result
+
+    def _attrs_for(node, tag_local, html_tag):
+        attrs = {k: node.get(k) for k in KEEP_ATTRS if node.get(k)}
+        style = {}
+        if tag_local == 'font':
+            size_val = (node.get('size') or '').strip()
+            if size_val in FONT_SIZE_MAP:
+                style['font-size'] = FONT_SIZE_MAP[size_val]
+            color_val = (node.get('color') or '').strip()
+            if color_val and color_val.lower() not in ('#000000', 'black', '#000'):
+                style['color'] = color_val
+            face_val = (node.get('face') or '').strip()
+            if face_val:
+                style['font-family'] = face_val
+        if css_class_styles and attrs.get('class'):
+            for cls in attrs['class'].split():
+                for prop, val in (css_class_styles.get(cls) or {}).items():
+                    if prop in KEEP_INLINE_PROPS and prop not in style:
+                        style[prop] = val
+        style.update(_parse_style(node.get('style')))
+        if style and html_tag in ('span', 'small', 'a'):
+            attrs['style'] = '; '.join(f'{k}:{v}' for k, v in style.items())
+        return attrs
+
+    def _serialize(node) -> str:
+        if not isinstance(node.tag, str):
+            return ''
+        tag_local = node.tag.lower().split('}')[-1]
+        html_tag = TAG_MAP.get(tag_local)
+        inner = ''
+        if node.text:
+            inner += html_module.escape(node.text)
+        for child in node:
+            inner += _serialize(child)
+            if child.tail:
+                inner += html_module.escape(child.tail)
+        if not html_tag:
+            return inner
+        attrs = _attrs_for(node, tag_local, html_tag)
+        attr_str = ''.join(
+            f' {k}="{html_module.escape(str(v), quote=True)}"' for k, v in attrs.items()
+        )
+        return f'<{html_tag}{attr_str}>{inner}</{html_tag}>'
+
+    parts = []
+    if element.text:
+        parts.append(html_module.escape(element.text))
+    for child in element:
+        parts.append(_serialize(child))
+        if child.tail:
+            parts.append(html_module.escape(child.tail))
+    return f'<p xmlns="{XHTML_NS}" id="{element_id}">{"".join(parts)}</p>'
+
 class MobiProcessor(FileProcessor):
     def __init__(self, app_settings: dict):
         self.app_settings = app_settings
@@ -2572,7 +2653,7 @@ class MobiProcessor(FileProcessor):
                     'paragraph_number': fragment_id,
                     'has_mismatch': False,
                     'processing_mode': 'legacy',
-                    'original_html': self._build_kindle_original_html(elem, elem_id_str),
+                    'original_html': self._build_kindle_original_html(elem, elem_id_str, css_class_styles),
                     'reserve_elements': [],
                     'prefix_reserve_tags': [],
                     'suffix_reserve_tags': [],
@@ -2712,33 +2793,8 @@ class MobiProcessor(FileProcessor):
 
         return serialize(element).strip(), inline_formatting_map
 
-    def _build_kindle_original_html(self, element, element_id: str) -> str:
-        XHTML_NS = 'http://www.w3.org/1999/xhtml'
-        INLINE_MAP = {'b': 'b', 'strong': 'b', 'i': 'em', 'em': 'em', 'u': 'u'}
-
-        def _serialize(node) -> str:
-            tag = node.tag if isinstance(node.tag, str) else ''
-            tag_local = tag.lower().split('}')[-1]
-            xhtml_tag = INLINE_MAP.get(tag_local)
-            inner = ''
-            if node.text:
-                inner += html_module.escape(node.text)
-            for child in node:
-                inner += _serialize(child)
-                if child.tail:
-                    inner += html_module.escape(child.tail)
-            if xhtml_tag:
-                return f'<{xhtml_tag}>{inner}</{xhtml_tag}>'
-            return inner
-
-        parts = []
-        if element.text:
-            parts.append(html_module.escape(element.text))
-        for child in element:
-            parts.append(_serialize(child))
-            if child.tail:
-                parts.append(html_module.escape(child.tail))
-        return f'<p xmlns="{XHTML_NS}" id="{element_id}">{"".join(parts)}</p>'
+    def _build_kindle_original_html(self, element, element_id: str, css_class_styles: dict = None) -> str:
+        return _build_legacy_original_html(element, element_id, css_class_styles)
 
 class AZW3Processor:
     def __init__(self, app_settings: dict):
@@ -3609,30 +3665,7 @@ class AZW3Processor:
         return serialize(element).strip(), inline_formatting_map
 
     def _build_html_original(self, element, element_id: str) -> str:
-        XHTML_NS = 'http://www.w3.org/1999/xhtml'
-        INLINE_MAP = {'b': 'b', 'strong': 'b', 'i': 'em', 'em': 'em', 'u': 'u'}
-        def _serialize(node) -> str:
-            tag = node.tag if isinstance(node.tag, str) else ''
-            tag_local = tag.lower().split('}')[-1]
-            xhtml_tag = INLINE_MAP.get(tag_local)
-            inner = ''
-            if node.text:
-                inner += html_module.escape(node.text)
-            for child in node:
-                inner += _serialize(child)
-                if child.tail:
-                    inner += html_module.escape(child.tail)
-            if xhtml_tag:
-                return f'<{xhtml_tag}>{inner}</{xhtml_tag}>'
-            return inner
-        parts = []
-        if element.text:
-            parts.append(html_module.escape(element.text))
-        for child in element:
-            parts.append(_serialize(child))
-            if child.tail:
-                parts.append(html_module.escape(child.tail))
-        return f'<p xmlns="{XHTML_NS}" id="{element_id}">{"".join(parts)}</p>'
+        return _build_legacy_original_html(element, element_id, self.css_class_styles)
 
     def _has_any_text(self, element) -> bool:
         if element.text and element.text.strip():
@@ -4137,8 +4170,10 @@ class FB2Processor(FileProcessor):
             f'{{{self.FB2_NS}}}code': 'code',
             f'{{{self.FB2_NS}}}style': 'span',
         }
- 
+
         def _serialize(node) -> str:
+            if not isinstance(node.tag, str):
+                return ''
             local = node.tag.split('}')[-1] if '}' in node.tag else node.tag
             inner = ''
             if node.text:
@@ -4149,14 +4184,19 @@ class FB2Processor(FileProcessor):
                     inner += html_module.escape(child.tail)
             xhtml_tag = TAG_MAP.get(node.tag)
             if xhtml_tag:
+                if local == 'style':
+                    name = node.get('name', '')
+                    if name:
+                        return f'<span data-fb2-style="{html_module.escape(name, quote=True)}">{inner}</span>'
+                    return f'<span>{inner}</span>'
                 return f'<{xhtml_tag}>{inner}</{xhtml_tag}>'
             if local == 'a':
                 href = node.get(f'{{{XLINK_NS}}}href') or node.get('href', '')
                 if href:
-                    return f'<a href="{html_module.escape(href)}">{inner}</a>'
+                    return f'<a href="{html_module.escape(href, quote=True)}">{inner}</a>'
                 return inner
             return inner
- 
+
         parts = []
         if element.text:
             parts.append(html_module.escape(element.text))
@@ -5110,16 +5150,25 @@ def _build_inline_segments(text: str, inline_map: dict, tag_profile: Optional[Ta
     def _flush(seg):
         if not seg:
             return
-        is_bold = any(inline_map.get(e, {}).get('tag') in ('b', 'strong') for e in stack)
-        is_italic = any(inline_map.get(e, {}).get('tag') in ('i', 'em') for e in stack)
-        is_underline = any(inline_map.get(e, {}).get('tag') == 'u' for e in stack)
+        names = [inline_map.get(e, {}).get('tag') for e in stack]
         link_href = next(
             (inline_map[e].get('attributes', {}).get('href', '')
              for e in reversed(stack)
              if inline_map.get(e, {}).get('tag') == 'a'),
             ''
         )
-        segments.append((seg, is_bold, is_italic, is_underline, link_href))
+        segments.append((
+            seg,
+            any(n in ('b', 'strong') for n in names),
+            any(n in ('i', 'em') for n in names),
+            'u' in names,
+            link_href,
+            any(n in ('s', 'del', 'strike') for n in names),
+            'sub' in names,
+            'sup' in names,
+            'code' in names,
+            '',
+        ))
 
     for m in token_re.finditer(text):
         if m.start() > pos:
@@ -5158,8 +5207,11 @@ def _fill_docx_paragraph(p, text: str, inline_map: dict,
 
 def _parse_aligned_html_segments(aligned_html: str):
     BOLD_TAGS = {'b', 'strong'}
-    ITALIC_TAGS = {'em', 'i'}
-    UNDERLINE_TAGS = {'u'}
+    ITALIC_TAGS = {'em', 'i', 'cite'}
+    UNDERLINE_TAGS = {'u', 'ins'}
+    STRIKE_TAGS = {'s', 'del', 'strike'}
+    CODE_TAGS = {'code', 'kbd', 'tt'}
+    empty_state = (False, False, False, '', False, False, False, False, '')
 
     try:
         elem = etree.fromstring(aligned_html.encode('utf-8'))
@@ -5169,76 +5221,106 @@ def _parse_aligned_html_segments(aligned_html: str):
             elem = etree.fromstring(wrapped.encode('utf-8'))
         except Exception:
             clean = re.sub(r'<[^>]+>', '', aligned_html)
-            return [(clean, False, False, False, '')] if clean.strip() else []
+            return [(clean,) + empty_state] if clean.strip() else []
 
     segments = []
 
-    def _walk(node, bold=False, italic=False, underline=False, link_href=''):
+    def _walk(node, state):
         if callable(node.tag):
             return
         t = etree.QName(node).localname.lower()
-        b = bold or (t in BOLD_TAGS)
-        i = italic or (t in ITALIC_TAGS)
-        u = underline or (t in UNDERLINE_TAGS)
-        href = link_href or (node.get('href', '') if t == 'a' else '')
+        bold, italic, underline, href, strike, sub, sup, code, style = state
+        new_state = (
+            bold or t in BOLD_TAGS,
+            italic or t in ITALIC_TAGS,
+            underline or t in UNDERLINE_TAGS,
+            href or (node.get('href', '') if t == 'a' else ''),
+            strike or t in STRIKE_TAGS,
+            sub or t == 'sub',
+            sup or t == 'sup',
+            code or t in CODE_TAGS,
+            style or (node.get('data-fb2-style', '') if t == 'span' else ''),
+        )
         if node.text:
-            segments.append((node.text, b, i, u, href))
+            segments.append((node.text,) + new_state)
         for child in node:
-            _walk(child, b, i, u, href)
+            _walk(child, new_state)
             if child.tail:
-                segments.append((child.tail, bold, italic, underline, link_href))
+                segments.append((child.tail,) + state)
 
-    _walk(elem)
+    _walk(elem, empty_state)
     return segments
+
+def _unpack_segment(item):
+    padded = tuple(item) + (False, False, False, '', False, False, False, False, '')[max(0, len(item) - 1):]
+    return padded[:10]
+
 
 def _fill_fb2_from_segments(p_elem, segments, FB2_NS: str) -> None:
     XLINK_NS = 'http://www.w3.org/1999/xlink'
     for item in segments:
-        seg_text = item[0]
-        bold = item[1]
-        italic = item[2]
-        link_href = item[4] if len(item) > 4 else ''
+        seg_text, bold, italic, underline, href, strike, sub, sup, code, style_name = _unpack_segment(item)
         if not seg_text:
             continue
 
-        if link_href:
-            a_elem = etree.SubElement(p_elem, f'{{{FB2_NS}}}a')
-            a_elem.set(f'{{{XLINK_NS}}}href', link_href)
-            if bold and italic:
-                em = etree.SubElement(a_elem, f'{{{FB2_NS}}}emphasis')
-                st = etree.SubElement(em, f'{{{FB2_NS}}}strong')
-                st.text = seg_text
-            elif italic:
-                em = etree.SubElement(a_elem, f'{{{FB2_NS}}}emphasis')
-                em.text = seg_text
-            elif bold:
-                st = etree.SubElement(a_elem, f'{{{FB2_NS}}}strong')
-                st.text = seg_text
+        chain = []
+        if href:
+            chain.append(('a', href))
+        if style_name:
+            chain.append(('style', style_name))
+        if italic:
+            chain.append(('emphasis', None))
+        if bold:
+            chain.append(('strong', None))
+        if strike:
+            chain.append(('strikethrough', None))
+        if sub:
+            chain.append(('sub', None))
+        if sup:
+            chain.append(('sup', None))
+        if code:
+            chain.append(('code', None))
+
+        if not chain:
+            if len(p_elem) == 0:
+                p_elem.text = (p_elem.text or '') + seg_text
             else:
-                a_elem.text = seg_text
-        else:
-            if bold and italic:
-                em = etree.SubElement(p_elem, f'{{{FB2_NS}}}emphasis')
-                st = etree.SubElement(em, f'{{{FB2_NS}}}strong')
-                st.text = seg_text
-            elif italic:
-                em = etree.SubElement(p_elem, f'{{{FB2_NS}}}emphasis')
-                em.text = seg_text
-            elif bold:
-                st = etree.SubElement(p_elem, f'{{{FB2_NS}}}strong')
-                st.text = seg_text
-            else:
-                if len(p_elem) == 0:
-                    p_elem.text = (p_elem.text or '') + seg_text
-                else:
-                    p_elem[-1].tail = (p_elem[-1].tail or '') + seg_text
+                p_elem[-1].tail = (p_elem[-1].tail or '') + seg_text
+            continue
+
+        parent = p_elem
+        for name, value in chain:
+            el = etree.SubElement(parent, f'{{{FB2_NS}}}{name}')
+            if name == 'a':
+                el.set(f'{{{XLINK_NS}}}href', value)
+            elif name == 'style':
+                el.set('name', value)
+            parent = el
+        parent.text = seg_text
+
+def _wrap_docx_run_in_hyperlink(p, run, href: str) -> None:
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import RGBColor
+
+    try:
+        r_id = p.part.relate_to(href, RT.HYPERLINK, is_external=True)
+    except Exception:
+        return
+    run.font.underline = True
+    run.font.color.rgb = RGBColor(0x05, 0x63, 0xC1)
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('r:id'), r_id)
+    hyperlink.set(qn('w:history'), '1')
+    r_elem = run._r
+    r_elem.addprevious(hyperlink)
+    hyperlink.append(r_elem)
+
 
 def _fill_docx_from_segments(p, segments) -> None:
     for item in segments:
-        seg_text = item[0]
-        bold = item[1]
-        italic = item[2]
-        underline = item[3]
+        seg_text, bold, italic, underline, href, strike, sub, sup, code, _style = _unpack_segment(item)
         if not seg_text:
             continue
         run = p.add_run(seg_text)
@@ -5248,6 +5330,16 @@ def _fill_docx_from_segments(p, segments) -> None:
             run.italic = True
         if underline:
             run.underline = True
+        if strike:
+            run.font.strike = True
+        if sub:
+            run.font.subscript = True
+        if sup:
+            run.font.superscript = True
+        if code:
+            run.font.name = 'Courier New'
+        if href and not href.startswith('#'):
+            _wrap_docx_run_in_hyperlink(p, run, href)
 
 class PDFtoPDFCreator(QThread):
     finished = pyqtSignal(str, bool)
@@ -7089,7 +7181,8 @@ class EPUBWriter(QThread):
                     text = _resolve_text(para, keep_html=True, tag_profile=self.tag_profile)
                     if not text:
                         continue
-                    text = self._restore_inline_html(text, para)
+                    if not (para.get('is_translated') and para.get('aligned_translated_html')):
+                        text = self._restore_inline_html(text, para)
 
                     if para.get('processing_mode') == 'inline':
                         t = text
