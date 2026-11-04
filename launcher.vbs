@@ -6,7 +6,7 @@ Set objFSO = CreateObject("Scripting.FileSystemObject")
 baseDir = objFSO.GetParentFolderName(WScript.ScriptFullName)
 
 venvPython = baseDir & "\venv\Scripts\python.exe"
-appFile = baseDir & "\app.py"
+appFile = baseDir & "\app\app.py"
 
 If Not objFSO.FileExists(venvPython) Then
     MsgBox "Virtual environment not found!" & vbCrLf & "Run install.bat first.", vbCritical, "Error"
@@ -14,7 +14,7 @@ If Not objFSO.FileExists(venvPython) Then
 End If
 
 If Not objFSO.FileExists(appFile) Then
-    MsgBox "app.py not found!", vbCritical, "Error"
+    MsgBox "app.py not found!" & vbCrLf & "Check that app\app.py exists.", vbCritical, "Error"
     WScript.Quit 1
 End If
 
