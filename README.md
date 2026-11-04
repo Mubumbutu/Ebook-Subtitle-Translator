@@ -1,11 +1,11 @@
-# EPUB / SRT / TXT / ASS / PDF / Kindle / FB2 / DOCX Translator with LLM
+# Ebook & Subtitle Translator
 
 <p align="center">
 </p>
 
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.1-blue" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-lightgrey" />
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-11.8%20%7C%2012.1%20%7C%2012.4-76b900?logo=nvidia&logoColor=white" />
@@ -46,6 +46,24 @@ A desktop application for translating **EPUB**, **SRT**, **TXT**, **ASS**, **PDF
 <summary><b>Version history</b> (click to expand)</summary>
 
 <br>
+
+### [1.1.1] - 2026-11-04
+**Added**
+- Sentence batching now supports `context_before` / `context_after` — context applies to the whole batch.
+- Batch JSON Payload mode now includes context sections in all default templates.
+
+**Changed**
+- Improved alignment handling of structural spans (`first-letter`, `last-word`) in both Legacy and Inline modes — tags are now placed deterministically without involving the LLM or neural model.
+- Structural span detection now works with multi-class attributes.
+- Batch mode no longer merges fragments from different chapters (`item_href`) into a single request.
+
+**Fixed**
+- `last-word` span is now correctly preserved in Inline mode and no longer absorbs trailing punctuation in Legacy mode.
+- Alignment indicator now shows the correct status for fully deterministic fragments.
+- Context spinboxes are now visible and editable in batch mode (previously hidden).
+
+**Removed**
+- Google Translate (Free) — public API no longer functional. Quick Translate default is now "DeepL Free".
 
 ### [1.1.0] - 2026-11-01
 **Added**
