@@ -1,0 +1,1976 @@
+# formatting.py
+import logging
+import re
+from typing import Dict, List, Optional, Tuple
+from app_utils import TagProfile, normalize_wrapper_variants, wrapper_tag_names
+
+logger = logging.getLogger(__name__)
+
+ALL_QUOTES_CHARS = '"\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02'
+DOUBLE_QUOTES_CHARS = '"\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u301D\u301E\u301F\uFF02'
+SINGLE_QUOTES_CHARS = '\'\u2018\u2019\u201A\u201B\u2032\u2039\u203A'
+
+ALL_QUOTES = r'["\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
+DOUBLE_QUOTES = r'["\u201C\u201D\u201E\u201F\u00AB\u00BB\u301D\u301E\u301F\uFF02]'
+SINGLE_QUOTES = r'[\'\u2018\u2019\u201A\u201B\u2032\u2039\u203A]'
+
+QUOTE_STYLE_OPTIONS = {
+    "neutral":      ('"',      '"'),
+    "polish":       ('\u201E', '\u201D'),
+    "english":      ('\u201C', '\u201D'),
+    "german":       ('\u201E', '\u201C'),
+    "french":       ('\u00AB', '\u00BB'),
+    "french_inner": ('\u2039', '\u203A'),
+    "swedish":      ('\u00BB', '\u00AB'),
+    "swiss":        ('\u00AB', '\u00BB'),
+    "russian":      ('\u00AB', '\u00BB'),
+    "cjk":          ('\u301D', '\u301E'),
+}
+
+QUOTE_STYLE_LABELS = [
+    ("neutral",      '"  "   — neutral ASCII'),
+    ("polish",       '\u201E  \u201D   — Polish / German (low-high)'),
+    ("english",      '\u201C  \u201D   — English typographic'),
+    ("german",       '\u201E  \u201C   — German alt (low-high reversed)'),
+    ("french",       '\u00AB  \u00BB   — French / Russian guillemets'),
+    ("french_inner", '\u2039  \u203A   — single guillemets'),
+    ("swedish",      '\u00BB  \u00AB   — Swedish / Finnish (reversed)'),
+    ("cjk",          '\u301D  \u301E   — CJK / Japanese'),
+]
+
+
+def apply_quote_style_to_text(text: str, open_char: str, close_char: str) -> str:
+    DOUBLE_QUOTES_VARIANTS = [
+        '"',
+        '\u201C', '\u201D', '\u201E', '\u201F',
+        '\u00AB', '\u00BB',
+        '\u2039', '\u203A',
+        '\u301D', '\u301E', '\u301F',
+        '\uFF02', '\u275D', '\u275E',
+    ]
+    result = text
+    for variant in DOUBLE_QUOTES_VARIANTS:
+        result = result.replace(variant, '"')
+
+    if open_char == '"' and close_char == '"':
+        return result
+
+    out = []
+    inside = False
+    for ch in result:
+        if ch == '"':
+            if not inside:
+                out.append(open_char)
+                inside = True
+            else:
+                out.append(close_char)
+                inside = False
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+def _is_ellipsis_ending(text: str) -> bool:
+    if not text:
+        return False
+    normalized = text.replace('\u00a0', ' ')
+    tail = normalized[-12:]
+    return bool(re.search(r'\.\s*\.\s*\.\s*$|…$', tail))
+
+def count_quotes(text: str) -> int:
+    return len(re.findall(ALL_QUOTES, text))
+
+def count_double_quotes(text: str) -> int:
+    return len(re.findall(DOUBLE_QUOTES, text))
+
+def count_all_quotes(text: str) -> int:
+    return sum(1 for ch in text if ch in DOUBLE_QUOTES_CHARS)
+
+def _placeholder_alternation(tag_profile: Optional[TagProfile] = None) -> str:
+    tp = tag_profile or TagProfile()
+    return "|".join([
+        rf'</?{re.escape(tp.inline_prefix)}\d{{2}}>',
+        rf'</?{re.escape(tp.reserve_prefix)}\d{{2}}>',
+        rf'<{re.escape(tp.non_trans_prefix)}\d{{2}}/>',
+        rf'</?{re.escape(tp.paragraph_separator)}>',
+        rf'<{re.escape(tp.batch_separator)}>',
+    ])
+
+def has_quote_at_start(text: str, tag_profile: Optional[TagProfile] = None) -> bool:
+    text = text.lstrip()
+    if not text:
+        return False
+
+    alt = _placeholder_alternation(tag_profile)
+    text_no_placeholders = re.sub(rf'^(?:{alt}|\s)+', '', text)
+
+    if not text_no_placeholders:
+        return False
+
+    if re.match(ALL_QUOTES, text_no_placeholders):
+        return True
+
+    if text_no_placeholders.startswith('- ') or text_no_placeholders.startswith('– ') or text_no_placeholders.startswith('— '):
+        return True
+
+    return False
+
+def has_quote_at_end(text: str, tag_profile: Optional[TagProfile] = None) -> bool:
+    text = text.rstrip()
+    if not text:
+        return False
+
+    alt = _placeholder_alternation(tag_profile)
+    text_no_placeholders = re.sub(rf'(?:\s|{alt})+$', '', text).rstrip()
+
+    if not text_no_placeholders:
+        return False
+
+    if re.match(ALL_QUOTES, text_no_placeholders[-1]):
+        return True
+
+    text_no_trailing_punct = re.sub(r'[.!?,…]+$', '', text_no_placeholders)
+    if text_no_trailing_punct and text_no_trailing_punct != text_no_placeholders:
+        if re.match(ALL_QUOTES, text_no_trailing_punct[-1]):
+            return True
+
+    return False
+
+def contains_dash(text: str) -> bool:
+    return '-' in text or '–' in text or '—' in text
+
+def count_external_quotes(text: str, tag_profile: Optional[TagProfile] = None) -> int:
+    count = 0
+    alt = _placeholder_alternation(tag_profile)
+
+    text_start = text.lstrip()
+    text_start_clean = re.sub(rf'^(?:{alt}|\s)+', '', text_start)
+
+    if text_start_clean and re.match(ALL_QUOTES, text_start_clean):
+        count += 1
+
+    text_end = text.rstrip()
+    text_end_clean = re.sub(rf'(?:\s|{alt})+$', '', text_end).rstrip()
+
+    if text_end_clean and re.match(ALL_QUOTES, text_end_clean[-1]):
+        count += 1
+
+    return count
+
+def add_quote_to_start(text: str, quote_char: str = '"', tag_profile: Optional[TagProfile] = None) -> str:
+    stripped = text.lstrip()
+    leading_ws = text[:len(text) - len(stripped)]
+    alt = _placeholder_alternation(tag_profile)
+
+    match = re.match(rf'^(?:{alt}|\s)*', stripped)
+    if match:
+        placeholders = match.group(0)
+        content = stripped[len(placeholders):]
+        return leading_ws + placeholders + quote_char + content
+    else:
+        return leading_ws + quote_char + stripped
+
+
+def add_quote_to_end(text: str, quote_char: str = '"', tag_profile: Optional[TagProfile] = None) -> str:
+    stripped = text.rstrip()
+    trailing_ws = text[len(stripped):]
+    alt = _placeholder_alternation(tag_profile)
+
+    match = re.search(rf'(?:{alt}|\s)*$', stripped)
+    if match:
+        placeholders = match.group(0)
+        content = stripped[:len(stripped) - len(placeholders)]
+        return content + quote_char + placeholders + trailing_ws
+    else:
+        return stripped + quote_char + trailing_ws
+
+def remove_quote_from_start(text: str, force: bool = False, tag_profile: Optional[TagProfile] = None) -> str:
+    stripped = text.lstrip()
+    leading_ws = text[:len(text) - len(stripped)]
+
+    if not stripped:
+        return text
+
+    alt = _placeholder_alternation(tag_profile)
+    match = re.match(rf'^(?:{alt}|\s)*', stripped)
+    if match:
+        placeholders = match.group(0)
+        content = stripped[len(placeholders):]
+
+        if not content:
+            return text
+
+        if re.match(ALL_QUOTES, content[0]):
+            if not force:
+                original_count = count_quotes(text)
+                if original_count % 2 == 0:
+                    return text
+            return leading_ws + placeholders + content[1:]
+
+    return text
+
+def remove_quote_from_end(text: str, force: bool = False, tag_profile: Optional[TagProfile] = None) -> str:
+    stripped = text.rstrip()
+    trailing_ws = text[len(stripped):]
+
+    if not stripped:
+        return text
+
+    alt = _placeholder_alternation(tag_profile)
+    match = re.search(rf'(?:{alt}|\s)*$', stripped)
+    if match:
+        placeholders = match.group(0)
+        content = stripped[:len(stripped) - len(placeholders)]
+
+        if not content:
+            return text
+
+        if re.match(ALL_QUOTES, content[-1]):
+            if not force:
+                original_count = count_quotes(text)
+                if original_count % 2 == 0:
+                    return text
+            return content[:-1] + placeholders + trailing_ws
+
+    return text
+
+def get_first_letter_info(text: str) -> Tuple[Optional[int], Optional[bool]]:
+    text_work = text.lstrip()
+
+    for dash in ['\u2014 ', '\u2013 ', '- ']:
+        if text_work.startswith(dash):
+            text_work = text_work[len(dash):].lstrip()
+            break
+
+    text_work = re.sub(f'^{ALL_QUOTES}+', '', text_work).lstrip()
+
+    if not text_work:
+        return None, None
+
+    in_tag = False
+    for i, char in enumerate(text_work):
+        if char == '<':
+            in_tag = True
+        elif char == '>':
+            in_tag = False
+        elif char.isalpha() and not in_tag:
+            return i, char.isupper()
+
+    return None, None
+
+def get_ending_punctuation(text: str) -> Tuple[Optional[str], Optional[int]]:
+    text_stripped = text.rstrip()
+    if not text_stripped:
+        return None, None
+
+    text_no_quotes = re.sub(f'{ALL_QUOTES}+$', '', text_stripped).rstrip()
+
+    if not text_no_quotes:
+        return None, None
+
+    if _is_ellipsis_ending(text_no_quotes):
+        return 'ellipsis', len(text_no_quotes) - 1
+
+    last_char = text_no_quotes[-1]
+
+    if last_char == '.':
+        return 'period', len(text_no_quotes) - 1
+    elif last_char == ',':
+        return 'comma', len(text_no_quotes) - 1
+    elif last_char == '!':
+        return 'exclamation', len(text_no_quotes) - 1
+    elif last_char == '?':
+        return 'question', len(text_no_quotes) - 1
+    elif last_char == '…':
+        return 'ellipsis', len(text_no_quotes) - 1
+    elif last_char == ';':
+        return 'semicolon', len(text_no_quotes) - 1
+    elif last_char == ':':
+        return 'colon', len(text_no_quotes) - 1
+
+    return None, None
+
+def add_punctuation(text: str, punct_type: str) -> str:
+    text_stripped = text.rstrip()
+    trailing_ws = text[len(text_stripped):]
+
+    text_no_quotes = re.sub(f'{ALL_QUOTES}+$', '', text_stripped)
+    trailing_quotes = text_stripped[len(text_no_quotes):]
+
+    text_core = text_no_quotes.rstrip()
+    quotes_ws = text_no_quotes[len(text_core):]
+
+    punct = '.' if punct_type == 'period' else ','
+    return text_core + punct + quotes_ws + trailing_quotes + trailing_ws
+
+def remove_punctuation(text: str, punct_type: str) -> str:
+    text_stripped = text.rstrip()
+    trailing_ws = text[len(text_stripped):]
+
+    text_no_quotes = re.sub(f'{ALL_QUOTES}+$', '', text_stripped)
+    trailing_quotes = text_stripped[len(text_no_quotes):]
+
+    text_core = text_no_quotes.rstrip()
+
+    if not text_core:
+        return text
+
+    punct = '.' if punct_type == 'period' else ','
+    if text_core.endswith(punct):
+        text_core = text_core[:-1]
+
+    return text_core + trailing_quotes + trailing_ws
+
+def replace_punctuation(text: str, from_punct: str, to_punct: str) -> str:
+    text_stripped = text.rstrip()
+    trailing_ws = text[len(text_stripped):]
+
+    text_no_quotes = re.sub(f'{ALL_QUOTES}+$', '', text_stripped)
+    trailing_quotes = text_stripped[len(text_no_quotes):]
+
+    text_core = text_no_quotes.rstrip()
+
+    if not text_core:
+        return text
+
+    from_char = '.' if from_punct == 'period' else ','
+    to_char = '.' if to_punct == 'period' else ','
+
+    if text_core.endswith(from_char):
+        text_core = text_core[:-1] + to_char
+
+    return text_core + trailing_quotes + trailing_ws
+
+class MismatchChecker:
+    DEFAULT_CHECKS = {
+        "paragraphs": True,
+        "first_char": True,
+        "last_char": True,
+        "length": True,
+        "quote_parity": True,
+        "untranslated": True,
+        "reserve_elements": True,
+        "inline_formatting": True,
+        "nt_markers": True,
+        "ps_markers": True,
+    }
+    DEFAULT_THRESHOLDS = {
+        "length_ratio_short": 1.6,
+        "length_ratio_medium": 1.4,
+        "length_ratio_long": 1.3,
+        "untranslated_ratio": 0.3,
+        "position_shift_threshold": 0.15,
+    }
+
+    def __init__(
+        self,
+        file_type: str,
+        processing_mode: str = "inline",
+        mismatch_settings: Dict = None,
+        tag_profile: Optional[TagProfile] = None
+    ):
+        self.file_type = file_type
+        self.processing_mode = processing_mode
+        self.tag_profile = tag_profile or TagProfile()
+
+        if mismatch_settings:
+            checks = self.DEFAULT_CHECKS.copy()
+            checks.update(mismatch_settings.get("mismatch_checks", {}))
+            self.checks = checks
+
+            thresholds = self.DEFAULT_THRESHOLDS.copy()
+            thresholds.update(mismatch_settings.get("mismatch_thresholds", {}))
+            self.thresholds = thresholds
+        else:
+            self.checks = self.DEFAULT_CHECKS.copy()
+            self.thresholds = self.DEFAULT_THRESHOLDS.copy()
+
+        logger.debug(
+            f"MismatchChecker init: file_type={file_type}, mode={processing_mode}, "
+            f"checks={self.checks}, thresholds={self.thresholds}"
+        )
+
+    def check_mismatch(self, para: Dict) -> Tuple[bool, Dict]:
+        processing_mode = para.get('processing_mode', self.processing_mode)
+        if processing_mode == 'legacy':
+            return self._check_mismatch_legacy(para)
+        else:
+            return self._check_mismatch_inline(para)
+
+    def check_batch_markers(self, response: str, expected_count: int) -> Tuple[bool, str]:
+        sep = f"<{self.tag_profile.batch_separator}>"
+        actual_count = len(self.tag_profile.batch_sep_re().findall(response))
+        if actual_count != expected_count:
+            return True, f"Expected {expected_count} {sep} markers, found {actual_count}"
+        return False, ""
+
+    def _dynamic_length_mismatch(self, a: str, b: str) -> bool:
+        if not a or not b:
+            return False
+        a_len, b_len = len(a), len(b)
+        shorter = min(a_len, b_len)
+        longer = max(a_len, b_len)
+        if shorter == 0:
+            return True
+
+        if a_len <= 20 and b_len <= 20:
+            return False
+        ratio = longer / shorter
+        if a_len <= 100 and b_len <= 100:
+            threshold = self.thresholds.get("length_ratio_short", 1.6)
+        elif a_len <= 500 and b_len <= 500:
+            threshold = self.thresholds.get("length_ratio_medium", 1.4)
+        else:
+            threshold = self.thresholds.get("length_ratio_long", 1.3)
+        return ratio > threshold
+
+    def _check_untranslated_with_threshold(self, orig: str, trans: str) -> bool:
+        orig_s = orig.strip()
+        trans_s = trans.strip()
+        if not orig_s or not trans_s:
+            return False
+        url_pattern = re.compile(
+            r'^(https?://\S+|www\.\S+|\S+@\S+\.\S+|[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}(/\S*)?)$',
+            re.IGNORECASE
+        )
+        if orig_s == trans_s:
+            text = orig_s
+            if url_pattern.match(text):
+                return False
+            if ' ' not in text and '\n' not in text:
+                return False
+            words = re.findall(r'[^\W\d_]+', text, re.UNICODE)
+            if not words or len(words) <= 2:
+                return False
+            uppercase_words = [w for w in words if w[0].isupper()]
+            if len(uppercase_words) / len(words) > 0.7:
+                return False
+            lowercase_words = [w for w in words if w[0].islower()]
+            ratio = len(lowercase_words) / len(words)
+            threshold = self.thresholds.get("untranslated_ratio", 0.3)
+            return ratio > threshold
+        if trans_s.startswith(orig_s) and len(trans_s) > len(orig_s):
+            if url_pattern.match(orig_s):
+                return False
+            if ' ' not in orig_s and '\n' not in orig_s:
+                return False
+            words = re.findall(r'[^\W\d_]+', orig_s, re.UNICODE)
+            if not words or len(words) <= 2:
+                return False
+            return True
+        return False
+
+    def _detect_raw_html_and_drift(self, orig: str, trans_raw: str, trans: str) -> Dict:
+        flags = {}
+        tp = self.tag_profile
+
+        unexpected = re.findall(r'</?([a-zA-Z][^>\s]*)[^>]*>', trans_raw)
+
+        placeholder_name_re = re.compile(
+            rf'^/?(?:{re.escape(tp.inline_prefix)}|{re.escape(tp.reserve_prefix)}|{re.escape(tp.non_trans_prefix)})\d{{2}}$',
+            re.IGNORECASE
+        )
+        allowed_names = {
+            'translated', 'translation',
+            tp.inline_prefix.rstrip('_').lower(),
+            tp.reserve_prefix.rstrip('_').lower(),
+            tp.non_trans_prefix.rstrip('_').lower(),
+            tp.paragraph_separator.lower(),
+            tp.batch_separator.lower(),
+        }
+
+        def _is_allowed_tag(tag: str) -> bool:
+            t = tag.lower().rstrip('/')
+            if t in allowed_names:
+                return True
+            if placeholder_name_re.match(t):
+                return True
+            return False
+
+        bad_tags = [t for t in unexpected if not _is_allowed_tag(t)]
+        if bad_tags:
+            flags["unexpected_html"] = bad_tags
+
+        orig_words = set(re.findall(r'\b\w+\b', orig.lower()))
+        trans_words = set(re.findall(r'\b\w+\b', trans.lower()))
+        if orig_words and len(orig_words) >= 5 and len(trans) > len(orig) * 2.0:
+            overlap = len(orig_words & trans_words) / len(orig_words)
+            if overlap < 0.40:
+                flags["content_drift"] = True
+
+        return flags
+
+    def _check_mismatch_inline(self, para: Dict) -> Tuple[bool, Dict]:
+        if para.get("ignore_mismatch", False):
+            return False, {}
+        if para.get("force_mismatch", False):
+            return True, {"manual": True}
+        if not para.get("is_translated"):
+            return False, {}
+
+        orig_raw = para.get("original_text", "")
+        trans_raw = para.get("translated_text", "")
+
+        if 'auto_wrap_tags' in para and trans_raw:
+            trans_raw = self._extract_text_without_auto_wrap(trans_raw, para['auto_wrap_tags'])
+
+        reserve_ok, reserve_errors = self._check_reserve_elements_integrity(orig_raw, trans_raw)
+        nt_ok, nt_errors           = self._check_nt_markers_integrity(orig_raw, trans_raw)
+        inline_ok, inline_errors   = self._check_inline_formatting_integrity(orig_raw, trans_raw)
+        ps_ok, ps_errors           = self._check_ps_markers_integrity(orig_raw, trans_raw)
+
+        orig  = self._remove_all_placeholders(orig_raw)
+        trans = self._remove_all_placeholders(trans_raw)
+
+        if not trans.strip() or orig.strip() == trans.strip():
+            mismatch_flags = {}
+            if not reserve_ok and self.checks.get("reserve_elements", True):
+                mismatch_flags["reserve_elements"] = reserve_errors
+            if not nt_ok and self.checks.get("nt_markers", True):
+                mismatch_flags["nt_markers"] = nt_errors
+            if not inline_ok and self.checks.get("inline_formatting", True):
+                mismatch_flags["inline_formatting"] = inline_errors
+            if not ps_ok and self.checks.get("ps_markers", True):
+                mismatch_flags["ps_markers"] = ps_errors
+            if orig.strip() == trans.strip():
+                if self.checks.get("untranslated", True) and self._check_untranslated_with_threshold(orig, trans):
+                    mismatch_flags["untranslated"] = True
+            return len(mismatch_flags) > 0, mismatch_flags
+
+        def count_paragraphs(text):
+            parts = [p for p in text.split("\n\n") if p.strip()]
+            return len(parts) if len(parts) > 1 else len([p for p in text.split("\n") if p.strip()])
+
+        def first_char_type(text):
+            text = text.lstrip()
+            if not text: return "none"
+            c = text[0]
+            if c == '<': return "placeholder"
+            elif c in ALL_QUOTES_CHARS: return "quote"
+            elif c.isdigit(): return "digit"
+            elif c.isalpha(): return "letter"
+            else: return "other"
+
+        def last_char_type(text):
+            text = text.rstrip()
+            if not text: return {"type": "empty"}
+            t = text
+            for ch in reversed(t):
+                if ch not in ALL_QUOTES_CHARS: break
+                t = t[:-1]
+            t = t.rstrip()
+            if not t: return {"type": "quote_only"}
+            lc = t[-1]
+            if lc == '.' and _is_ellipsis_ending(t): return {"type": "ellipsis"}
+            mapping = {'.': 'period', ',': 'comma', '!': 'exclamation', '?': 'question', '…': 'ellipsis'}
+            if lc in mapping: return {"type": mapping[lc]}
+            if lc in ';:': return {"type": "semicolon_colon"}
+            elif lc.isalpha(): return {"type": "letter"}
+            elif lc.isdigit(): return {"type": "digit"}
+            else: return {"type": "other"}
+
+        def check_quote_parity(orig_text, trans_text):
+            orig_count  = count_all_quotes(orig_text)
+            trans_count = count_all_quotes(trans_text)
+            if orig_count % 2 != 0 and orig_count == trans_count: return False
+            return trans_count % 2 != 0
+
+        orig_para_count  = count_paragraphs(orig)
+        trans_para_count = count_paragraphs(trans)
+
+        mismatch_flags = {}
+
+        if self.checks.get("paragraphs", True) and orig_para_count != trans_para_count:
+            mismatch_flags["paragraphs"] = {"orig": orig_para_count, "trans": trans_para_count}
+
+        if self.checks.get("first_char", True) and first_char_type(orig) != first_char_type(trans):
+            mismatch_flags["first_char"] = True
+
+        if self.checks.get("last_char", True) and last_char_type(orig)["type"] != last_char_type(trans)["type"]:
+            mismatch_flags["last_char"] = True
+
+        if self.checks.get("length", True):
+            orig_len = len(orig.strip())
+            trans_len = len(trans.strip())
+            too_short_threshold = self.thresholds.get("length_ratio_too_short", 0.45)
+            length_flag = self._dynamic_length_mismatch(orig.strip(), trans.strip())
+            if not length_flag and orig_len >= 8:
+                length_flag = trans_len < orig_len * too_short_threshold
+            if length_flag:
+                mismatch_flags["length"] = {
+                    "orig_chars": orig_len,
+                    "trans_chars": trans_len,
+                    "ratio": round(trans_len / max(orig_len, 1), 2)
+                }
+
+        if self.checks.get("quote_parity", True) and check_quote_parity(orig, trans):
+            mismatch_flags["quote_parity"] = True
+
+        if self.checks.get("untranslated", True) and self._check_untranslated_with_threshold(orig, trans):
+            mismatch_flags["untranslated"] = True
+
+        if not reserve_ok and self.checks.get("reserve_elements", True):
+            mismatch_flags["reserve_elements"] = reserve_errors
+
+        if not nt_ok and self.checks.get("nt_markers", True):
+            mismatch_flags["nt_markers"] = nt_errors
+
+        if not inline_ok and self.checks.get("inline_formatting", True):
+            mismatch_flags["inline_formatting"] = inline_errors
+
+        if not ps_ok and self.checks.get("ps_markers", True):
+            mismatch_flags["ps_markers"] = ps_errors
+
+        extra_flags = self._detect_raw_html_and_drift(orig, trans_raw, trans)
+        for key, value in extra_flags.items():
+            if key == "unexpected_html":
+                if "inline_formatting" not in mismatch_flags:
+                    mismatch_flags["inline_formatting"] = {}
+                mismatch_flags["inline_formatting"]["unexpected_tags"] = value
+            else:
+                mismatch_flags[key] = value
+
+        has_mismatch = any(mismatch_flags.values())
+        return has_mismatch, mismatch_flags
+
+    def _check_mismatch_legacy(self, para: Dict) -> Tuple[bool, Dict]:
+        if para.get("ignore_mismatch", False):
+            return False, {}
+        if para.get("force_mismatch", False):
+            return True, {"manual": True}
+        if not para.get("is_translated"):
+            return False, {}
+
+        orig_raw = para.get("original_text", "")
+        trans_raw = para.get("translated_text", "")
+
+        reserve_ok, reserve_errors = self._check_reserve_elements_legacy(orig_raw, trans_raw)
+
+        reserve_open = self.tag_profile.reserve_open_re()
+        orig = reserve_open.sub('', orig_raw)
+        trans = reserve_open.sub('', trans_raw)
+
+        if not trans.strip() or orig.strip() == trans.strip():
+            mismatch_flags = {}
+            if not reserve_ok and self.checks.get("reserve_elements", True):
+                mismatch_flags["reserve_elements"] = reserve_errors
+            if orig.strip() == trans.strip():
+                if self.checks.get("untranslated", True) and self._check_untranslated_with_threshold(orig, trans):
+                    mismatch_flags["untranslated"] = True
+            return len(mismatch_flags) > 0, mismatch_flags
+
+        def count_paragraphs(text):
+            parts = [p for p in text.split("\n\n") if p.strip()]
+            return len(parts) if len(parts) > 1 else len([p for p in text.split("\n") if p.strip()])
+
+        def first_char_type(text):
+            text = text.lstrip()
+            if not text: return "none"
+            c = text[0]
+            if c in ALL_QUOTES_CHARS: return "quote"
+            elif c.isdigit(): return "digit"
+            elif c.isalpha(): return "letter"
+            else: return "other"
+
+        def last_char_type(text):
+            text = text.rstrip()
+            if not text: return {"type": "empty"}
+            t = text
+            for ch in reversed(t):
+                if ch not in ALL_QUOTES_CHARS: break
+                t = t[:-1]
+            t = t.rstrip()
+            if not t: return {"type": "quote_only"}
+            lc = t[-1]
+            if lc == '.' and _is_ellipsis_ending(t): return {"type": "ellipsis"}
+            mapping = {'.': 'period', ',': 'comma', '!': 'exclamation', '?': 'question', '…': 'ellipsis'}
+            if lc in mapping: return {"type": mapping[lc]}
+            if lc in ';:': return {"type": "semicolon_colon"}
+            elif lc.isalpha(): return {"type": "letter"}
+            elif lc.isdigit(): return {"type": "digit"}
+            else: return {"type": "other"}
+
+        def check_quote_parity(orig_text, trans_text):
+            orig_count = count_all_quotes(orig_text)
+            trans_count = count_all_quotes(trans_text)
+            if orig_count % 2 != 0 and orig_count == trans_count: return False
+            return trans_count % 2 != 0
+
+        orig_para_count = count_paragraphs(orig)
+        trans_para_count = count_paragraphs(trans)
+
+        mismatch_flags = {}
+
+        if self.checks.get("paragraphs", True) and orig_para_count != trans_para_count:
+            mismatch_flags["paragraphs"] = {"orig": orig_para_count, "trans": trans_para_count}
+
+        if self.checks.get("first_char", True) and first_char_type(orig) != first_char_type(trans):
+            mismatch_flags["first_char"] = True
+
+        if self.checks.get("last_char", True) and last_char_type(orig)["type"] != last_char_type(trans)["type"]:
+            mismatch_flags["last_char"] = True
+
+        if self.checks.get("length", True):
+            orig_len = len(orig.strip())
+            trans_len = len(trans.strip())
+            too_short_threshold = self.thresholds.get("length_ratio_too_short", 0.45)
+            length_flag = self._dynamic_length_mismatch(orig, trans)
+            if length_flag:
+                orig_words = len(orig.split())
+                trans_words = len(trans.split())
+                if 0.5 <= trans_words / max(orig_words, 1) <= 3.0:
+                    length_flag = False
+            if not length_flag and orig_len >= 8:
+                length_flag = trans_len < orig_len * too_short_threshold
+            if length_flag:
+                mismatch_flags["length"] = True
+
+        if self.checks.get("quote_parity", True) and check_quote_parity(orig, trans):
+            mismatch_flags["quote_parity"] = True
+
+        if self.checks.get("untranslated", True) and self._check_untranslated_with_threshold(orig, trans):
+            mismatch_flags["untranslated"] = True
+
+        if not reserve_ok and self.checks.get("reserve_elements", True):
+            mismatch_flags["reserve_elements"] = reserve_errors
+
+        has_mismatch = any(mismatch_flags.values())
+        return has_mismatch, mismatch_flags
+
+    def _check_untranslated(self, orig: str, trans: str) -> bool:
+        return self._check_untranslated_with_threshold(orig, trans)
+
+    def _check_reserve_elements_integrity(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
+        tp = self.tag_profile
+        open_re = tp.reserve_open_re()
+        orig_reserves  = open_re.findall(original)
+        trans_reserves = open_re.findall(translated)
+
+        error_details: Dict = {}
+
+        if sorted(orig_reserves) != sorted(trans_reserves):
+            missing = [tp.reserve_placeholder(int(t)) for t in orig_reserves
+                       if orig_reserves.count(t) > trans_reserves.count(t)]
+            extra   = [tp.reserve_placeholder(int(t)) for t in trans_reserves
+                       if trans_reserves.count(t) > orig_reserves.count(t)]
+            if missing:
+                error_details['missing'] = list(set(missing))
+            if extra:
+                error_details['extra'] = list(set(extra))
+
+        spurious_closing = tp.reserve_close_re().findall(translated)
+        if spurious_closing:
+            error_details['spurious_closing'] = list(
+                set(f"</{tp.reserve_prefix}{t}>" for t in spurious_closing)
+            )
+
+        threshold = self.thresholds.get("position_shift_threshold", 0.15)
+
+        orig_positions  = self._get_self_closing_tag_positions(original,   open_re)
+        trans_positions = self._get_self_closing_tag_positions(translated, open_re)
+
+        common_ids = set(orig_positions.keys()) & set(trans_positions.keys())
+        positioning_errors = []
+
+        for tag_id in sorted(common_ids):
+            orig_pos  = orig_positions[tag_id]
+            trans_pos = trans_positions[tag_id]
+
+            if abs(orig_pos - trans_pos) > threshold:
+                positioning_errors.append({
+                    'tag_id':       tag_id,
+                    'issue':        'position_shift',
+                    'orig_rel_pos':  round(orig_pos,  2),
+                    'trans_rel_pos': round(trans_pos, 2),
+                    'description':  (
+                        f"{tp.reserve_placeholder(int(tag_id))} is at ~{orig_pos:.0%} in original "
+                        f"but at ~{trans_pos:.0%} in translation"
+                    ),
+                })
+
+        if positioning_errors:
+            error_details['positioning'] = positioning_errors
+
+        if error_details:
+            return False, error_details
+        return True, None
+
+    def _check_reserve_elements_legacy(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
+        return self._check_reserve_elements_integrity(original, translated)
+
+    def _check_inline_formatting_integrity(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
+        tp = self.tag_profile
+        open_re = tp.inline_open_re()
+        close_re = tp.inline_close_re()
+        orig_opens  = open_re.findall(original)
+        orig_closes = close_re.findall(original)
+        trans_opens  = open_re.findall(translated)
+        trans_closes = close_re.findall(translated)
+
+        error_details = {}
+
+        if sorted(orig_opens) != sorted(trans_opens):
+            missing_opens = [tp.inline_open_placeholder(int(t)) for t in orig_opens if orig_opens.count(t) > trans_opens.count(t)]
+            extra_opens   = [tp.inline_open_placeholder(int(t)) for t in trans_opens if trans_opens.count(t) > orig_opens.count(t)]
+            if missing_opens or extra_opens:
+                error_details['opening_tags'] = {}
+                if missing_opens: error_details['opening_tags']['missing'] = list(set(missing_opens))
+                if extra_opens:   error_details['opening_tags']['extra']   = list(set(extra_opens))
+
+        if sorted(orig_closes) != sorted(trans_closes):
+            missing_closes = [tp.inline_close_placeholder(int(t)) for t in orig_closes if orig_closes.count(t) > trans_closes.count(t)]
+            extra_closes   = [tp.inline_close_placeholder(int(t)) for t in trans_closes if trans_closes.count(t) > orig_closes.count(t)]
+            if missing_closes or extra_closes:
+                error_details['closing_tags'] = {}
+                if missing_closes: error_details['closing_tags']['missing'] = list(set(missing_closes))
+                if extra_closes:   error_details['closing_tags']['extra']   = list(set(extra_closes))
+
+        unpaired = []
+        for tag_id in set(trans_opens + trans_closes):
+            open_count  = trans_opens.count(tag_id)
+            close_count = trans_closes.count(tag_id)
+            if open_count != close_count:
+                unpaired.append({'tag_id': tag_id, 'open_count': open_count, 'close_count': close_count})
+        if unpaired:
+            error_details['unpaired_tags'] = unpaired
+
+        position_errors = self._check_inline_formatting_position(original, translated)
+        if position_errors:
+            error_details['positioning'] = position_errors
+
+        is_ok = len(error_details) == 0
+        return is_ok, error_details if not is_ok else None
+
+    def _check_inline_formatting_position(self, original: str, translated: str) -> List[Dict]:
+        errors = []
+        ip = self.tag_profile.inline_prefix
+        orig_structure  = self._parse_inline_structure(original)
+        trans_structure = self._parse_inline_structure(translated)
+        all_tag_ids = set(orig_structure.keys()) | set(trans_structure.keys())
+
+        inline_threshold = self.thresholds.get("inline_position_shift_threshold", 0.30)
+
+        for tag_id in all_tag_ids:
+            orig_info  = orig_structure.get(tag_id)
+            trans_info = trans_structure.get(tag_id)
+            if not orig_info or not trans_info:
+                continue
+
+            orig_coverage  = orig_info.get('coverage', 0)
+            trans_coverage = trans_info.get('coverage', 0)
+            if abs(orig_coverage - trans_coverage) > 0.3:
+                errors.append({
+                    'tag_id':        tag_id,
+                    'issue':         'coverage_mismatch',
+                    'orig_coverage':  round(orig_coverage,  2),
+                    'trans_coverage': round(trans_coverage, 2),
+                    'orig_content':   orig_info.get('content', ''),
+                    'trans_content':  trans_info.get('content', ''),
+                    'description': (
+                        f"Tag <{ip}{tag_id}> covers {orig_coverage:.0%} of text in original "
+                        f"but {trans_coverage:.0%} in translation"
+                    ),
+                })
+
+            orig_rel_start  = orig_info.get('relative_start', 0)
+            trans_rel_start = trans_info.get('relative_start', 0)
+            if abs(orig_rel_start - trans_rel_start) > inline_threshold:
+                errors.append({
+                    'tag_id':          tag_id,
+                    'issue':           'position_shift',
+                    'orig_rel_start':   round(orig_rel_start,  2),
+                    'trans_rel_start':  round(trans_rel_start, 2),
+                    'orig_content':     orig_info.get('content', ''),
+                    'trans_content':    trans_info.get('content', ''),
+                    'description': (
+                        f"Tag <{ip}{tag_id}> starts at {orig_rel_start:.0%} in original "
+                        f"but at {trans_rel_start:.0%} in translation"
+                    ),
+                })
+
+            orig_parent  = orig_info.get('parent')
+            trans_parent = trans_info.get('parent')
+            if orig_parent != trans_parent:
+                errors.append({
+                    'tag_id':       tag_id,
+                    'issue':        'nesting_mismatch',
+                    'orig_parent':   orig_parent,
+                    'trans_parent':  trans_parent,
+                    'orig_content':  orig_info.get('content', ''),
+                    'trans_content': trans_info.get('content', ''),
+                    'description': (
+                        f"Tag <{ip}{tag_id}> has different nesting: "
+                        f"parent {orig_parent} in original, {trans_parent} in translation"
+                    ),
+                })
+
+        return errors
+
+    def _parse_inline_structure(self, text: str) -> Dict:
+        tp = self.tag_profile
+        placeholder_re = tp.all_placeholders_re()
+        open_re = tp.inline_open_re()
+        close_re = tp.inline_close_re()
+
+        clean_text = placeholder_re.sub('', text)
+        total_length = len(clean_text)
+        if total_length == 0:
+            return {}
+
+        token_re = re.compile(f'{placeholder_re.pattern}|[^<]+|<[^>]*>')
+
+        structure = {}
+        stack = []
+        current_pos = 0
+        content_accumulator: Dict[str, str] = {}
+
+        for match in token_re.finditer(text):
+            token = match.group(0)
+            open_match = open_re.fullmatch(token)
+            close_match = close_re.fullmatch(token)
+
+            if open_match:
+                tag_id = open_match.group(1)
+                stack.append((tag_id, current_pos))
+                content_accumulator[tag_id] = ''
+
+            elif close_match:
+                tag_id = close_match.group(1)
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i][0] == tag_id:
+                        opening_tag_id, start_pos = stack.pop(i)
+                        end_pos = current_pos
+                        length = end_pos - start_pos
+                        coverage = length / total_length if total_length > 0 else 0
+                        relative_start = start_pos / total_length if total_length > 0 else 0
+                        parent = stack[-1][0] if stack else None
+                        tag_content = content_accumulator.pop(tag_id, '').strip()
+                        if tag_id not in structure:
+                            structure[tag_id] = {
+                                'start': start_pos, 'end': end_pos,
+                                'length': length, 'coverage': coverage,
+                                'relative_start': relative_start,
+                                'content': tag_content,
+                                'parent': parent, 'children': []
+                            }
+                        if parent and parent in structure:
+                            if tag_id not in structure[parent]['children']:
+                                structure[parent]['children'].append(tag_id)
+                        break
+
+            elif placeholder_re.fullmatch(token):
+                pass
+
+            else:
+                current_pos += len(token)
+                for open_tag_id, _ in stack:
+                    if open_tag_id in content_accumulator:
+                        content_accumulator[open_tag_id] += token
+
+        return structure
+
+    def _get_self_closing_tag_positions(self, text: str, tag_regex) -> Dict[str, float]:
+        placeholder_re = self.tag_profile.all_placeholders_re()
+        target_re = re.compile(tag_regex)
+
+        clean_text = placeholder_re.sub('', text)
+        total_len = len(clean_text)
+        if total_len == 0:
+            return {}
+
+        positions: Dict[str, float] = {}
+        clean_pos = 0
+
+        token_re = re.compile(f'{placeholder_re.pattern}|[^<]+|<[^>]*>')
+
+        for m in token_re.finditer(text):
+            token = m.group(0)
+
+            target_match = target_re.match(token)
+            if target_match:
+                tag_id = target_match.group(1)
+                if tag_id not in positions:
+                    positions[tag_id] = clean_pos / total_len
+            elif placeholder_re.match(token):
+                pass
+            else:
+                clean_pos += len(token)
+
+        return positions
+
+    def _extract_text_without_auto_wrap(self, text: str, auto_wrap_tags: List[Dict]) -> str:
+        working_text = text.strip()
+        for tag_info in auto_wrap_tags:
+            opening = tag_info['opening']
+            closing = tag_info['closing']
+            if working_text.startswith(opening) and working_text.endswith(closing):
+                working_text = working_text[len(opening):-len(closing)].strip()
+            else:
+                break
+        return working_text
+
+    def _remove_all_placeholders(self, text: str) -> str:
+        return self.tag_profile.all_placeholders_re().sub('', text)
+
+    def _check_nt_markers_integrity(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
+        tp = self.tag_profile
+        nt_re = tp.non_trans_open_re()
+        orig_nt  = nt_re.findall(original)
+        trans_nt = nt_re.findall(translated)
+
+        error_details: Dict = {}
+
+        if sorted(orig_nt) != sorted(trans_nt):
+            missing = [tp.non_trans_placeholder(int(t)) for t in orig_nt
+                       if orig_nt.count(t) > trans_nt.count(t)]
+            extra   = [tp.non_trans_placeholder(int(t)) for t in trans_nt
+                       if trans_nt.count(t) > orig_nt.count(t)]
+            if missing:
+                error_details['missing'] = list(set(missing))
+            if extra:
+                error_details['extra'] = list(set(extra))
+
+        threshold = self.thresholds.get("position_shift_threshold", 0.15)
+
+        orig_positions  = self._get_self_closing_tag_positions(original,   nt_re)
+        trans_positions = self._get_self_closing_tag_positions(translated, nt_re)
+
+        common_ids = set(orig_positions.keys()) & set(trans_positions.keys())
+        positioning_errors = []
+
+        for tag_id in sorted(common_ids):
+            orig_pos  = orig_positions[tag_id]
+            trans_pos = trans_positions[tag_id]
+
+            if abs(orig_pos - trans_pos) > threshold:
+                positioning_errors.append({
+                    'tag_id':        tag_id,
+                    'issue':         'position_shift',
+                    'orig_rel_pos':   round(orig_pos,  2),
+                    'trans_rel_pos':  round(trans_pos, 2),
+                    'description':   (
+                        f"{tp.non_trans_placeholder(int(tag_id))} is at ~{orig_pos:.0%} in original "
+                        f"but at ~{trans_pos:.0%} in translation"
+                    ),
+                })
+
+        if positioning_errors:
+            error_details['positioning'] = positioning_errors
+
+        if error_details:
+            return False, error_details
+        return True, None
+
+    def _check_ps_markers_integrity(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
+        ps_re = self.tag_profile.paragraph_sep_re()
+        orig_ps = ps_re.findall(original)
+        trans_ps = ps_re.findall(translated)
+
+        if not orig_ps and not trans_ps:
+            return True, None
+
+        if not orig_ps and trans_ps:
+            return False, {
+                'expected': 0,
+                'found': len(trans_ps),
+                'missing': 0,
+                'extra': len(trans_ps),
+            }
+
+        if len(orig_ps) == len(trans_ps):
+            return True, None
+
+        error_details = {
+            'expected': len(orig_ps),
+            'found': len(trans_ps),
+            'missing': max(0, len(orig_ps) - len(trans_ps)),
+            'extra': max(0, len(trans_ps) - len(orig_ps)),
+        }
+        return False, error_details
+
+class FormattingSynchronizer:
+    def __init__(
+        self,
+        file_type: str,
+        quote_style: str = 'neutral',
+        response_wrapper_tag: str = 'translated',
+        tag_profile: Optional[TagProfile] = None,
+        response_wrapper_tag_variants: Optional[List[str]] = None
+    ):
+        self.file_type = file_type
+        self.quote_style = quote_style
+        pair = QUOTE_STYLE_OPTIONS.get(quote_style, ('"', '"'))
+        self._quote_open: str = pair[0]
+        self._quote_close: str = pair[1]
+        self.response_wrapper_tag = (response_wrapper_tag or 'translated').strip() or 'translated'
+        self.response_wrapper_tag_variants = normalize_wrapper_variants(
+            response_wrapper_tag_variants,
+            self.response_wrapper_tag
+        )
+        self.tag_profile = tag_profile or TagProfile()
+
+    def sync_formatting(
+        self,
+        original: str,
+        translated: str,
+        para: Optional[Dict] = None
+    ) -> str:
+        if original == translated:
+            return translated
+
+        if not translated.strip():
+            return translated
+
+        if para and para.get('processing_mode') == 'legacy':
+            return self._sync_formatting_legacy(original, translated)
+        else:
+            return self._sync_formatting_new(original, translated, para)
+
+    def _sync_formatting_legacy(self, original: str, translated: str) -> str:
+        if original == translated:
+            return translated
+
+        if not translated.strip():
+            return translated
+
+        result = translated
+
+        result = self.remove_malformed_xml_tags(result)
+
+        result = self.normalize_quotes(result)
+
+        if self.file_type == "srt":
+            result = self.sync_formatting_legacy_srt(original, result)
+        else:
+            result = self.sync_formatting_legacy_epub(original, result)
+
+        return result
+
+    def _sync_formatting_new(self, original: str, translated: str, para: Optional[Dict] = None) -> str:
+        result = self.remove_malformed_xml_tags(translated)
+
+        result = self.normalize_quotes(result)
+
+        if self.file_type in ("srt", "ass"):
+            result = self.sync_formatting_srt(original, result)
+        else:
+            result = self.sync_formatting_epub(original, result)
+
+        return result
+
+    def remove_malformed_xml_tags(self, text: str) -> str:
+        text_stripped = text.strip()
+        leading_ws  = text[:len(text) - len(text.lstrip())]
+        trailing_ws = text[len(text.rstrip()):]
+
+        all_variants = set()
+        for tag_name in wrapper_tag_names(self.response_wrapper_tag, self.response_wrapper_tag_variants):
+            all_variants.update({
+                tag_name,
+                tag_name.upper(),
+                tag_name.lower(),
+                tag_name.capitalize(),
+            })
+
+        OPENING_TAGS = [f'<{v}>' for v in all_variants]
+        CLOSING_TAGS = [f'</{v}>' for v in all_variants]
+
+        has_translation_open  = any(text_stripped.startswith(t) for t in OPENING_TAGS)
+        has_translation_close = any(text_stripped.endswith(t) for t in CLOSING_TAGS)
+
+        if has_translation_open and has_translation_close:
+            for ot in OPENING_TAGS:
+                if not text_stripped.startswith(ot):
+                    continue
+                for ct in CLOSING_TAGS:
+                    if not text_stripped.endswith(ct):
+                        continue
+                    inner = text_stripped[len(ot):len(text_stripped) - len(ct)].strip()
+                    return leading_ws + inner + trailing_ws
+
+        if '</text_to_translate>' in text_stripped:
+            text_stripped = text_stripped.replace('</text_to_translate>', '')
+            logger.debug("Removed rogue </text_to_translate> tag")
+
+        reserve_close = self.tag_profile.reserve_close_re()
+        if reserve_close.search(text_stripped):
+            text_stripped = reserve_close.sub('', text_stripped).strip()
+            logger.debug("Removed spurious reserve closing tag(s)")
+
+        has_opening_tag    = False
+        opening_tag_length = 0
+
+        for tag in OPENING_TAGS:
+            if text_stripped.startswith(tag):
+                has_opening_tag    = True
+                opening_tag_length = len(tag)
+                break
+
+        has_closing_tag    = False
+        closing_tag_length = 0
+
+        for tag in CLOSING_TAGS:
+            if text_stripped.endswith(tag):
+                has_closing_tag    = True
+                closing_tag_length = len(tag)
+                break
+
+        if has_opening_tag and has_closing_tag:
+            text_without_tags = text_stripped[opening_tag_length:-closing_tag_length].strip()
+            return leading_ws + text_without_tags + trailing_ws
+
+        if has_opening_tag and not has_closing_tag:
+            text_without_opening = text_stripped[opening_tag_length:].strip()
+            return leading_ws + text_without_opening + trailing_ws
+
+        if not has_opening_tag and has_closing_tag:
+            text_without_closing = text_stripped[:-closing_tag_length].strip()
+            return leading_ws + text_without_closing + trailing_ws
+
+        variants_alt = '|'.join(re.escape(v) for v in all_variants)
+        cleaned = re.sub(rf'</?(?:{variants_alt})>', '', text_stripped, flags=re.IGNORECASE)
+        if cleaned != text_stripped:
+            logger.debug("Removed stray wrapper tag(s) from within text")
+            text_stripped = cleaned.strip()
+
+        return leading_ws + text_stripped + trailing_ws
+
+    def normalize_quotes(self, text: str) -> str:
+        SINGLE_QUOTES_VARIANTS = [
+            '\u2018', '\u2019', '\u201A', '\u201B',
+            '\u2032',
+            '\u275B', '\u275C',
+        ]
+
+        result = text
+        for variant in SINGLE_QUOTES_VARIANTS:
+            result = result.replace(variant, "'")
+
+        open_char = self._quote_open
+        close_char = self._quote_close
+        result = apply_quote_style_to_text(result, open_char, close_char)
+
+        return result
+
+    def _sync_all_caps_legacy(self, original: str, translated: str) -> str:
+        orig_letters_only = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', original)
+
+        if not orig_letters_only:
+            return translated
+
+        is_all_caps = orig_letters_only.isupper()
+
+        if not is_all_caps:
+            return translated
+
+        if len(orig_letters_only) > 100:
+            trans_letters = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', translated)
+            if trans_letters:
+                upper_ratio = sum(1 for c in trans_letters if c.isupper()) / len(trans_letters)
+                if upper_ratio < 0.5:
+                    return translated
+
+        result = []
+        for char in translated:
+            if char.isalpha():
+                result.append(char.upper())
+            else:
+                result.append(char)
+
+        return ''.join(result)
+
+    def sync_formatting_srt(self, original: str, translated: str) -> str:
+        result = translated
+
+        result = self.sync_quotes(original, result)
+
+        result = self.sync_dialogue_dashes_srt(original, result)
+
+        result = self.sync_leading_whitespace(original, result)
+
+        result = self.sync_all_caps(original, result)
+
+        orig_letters_only = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', original)
+        is_all_caps = orig_letters_only.isupper() if orig_letters_only else False
+
+        if not is_all_caps:
+            result = self.sync_first_letter_case(original, result)
+
+        result = self.sync_ending_punctuation(original, result)
+
+        return result
+
+    def sync_formatting_epub(self, original: str, translated: str) -> str:
+        result = translated
+
+        result = self.sync_dialogue_dashes_epub(original, result)
+
+        result = self.sync_quotes(original, result)
+
+        result = self.sync_leading_whitespace_epub(original, result)
+
+        result = self.sync_all_caps(original, result)
+
+        orig_letters_only = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', original)
+        is_all_caps = orig_letters_only.isupper() if orig_letters_only else False
+
+        if not is_all_caps:
+            result = self.sync_first_letter_case_epub(original, result)
+
+        result = self.sync_ending_punctuation_epub(original, result)
+
+        result = self._remove_temporary_markers(result)
+
+        return result
+
+    def sync_dialogue_dashes_srt(self, original: str, translated: str) -> str:
+        if '\n' not in original:
+            return translated
+
+        orig_lines = original.split('\n')
+        trans_lines = translated.split('\n')
+
+        def get_dialogue_dash(text):
+            stripped = text.lstrip()
+            for dash in ['\u2014 ', '\u2013 ', '- ']:
+                if stripped.startswith(dash):
+                    return dash
+            return None
+
+        orig_dash_info = [get_dialogue_dash(line) for line in orig_lines]
+        dash_count = sum(1 for d in orig_dash_info if d is not None)
+
+        if dash_count < 2:
+            return translated
+
+        if len(orig_lines) != len(trans_lines):
+            if dash_count == len(orig_lines):
+                dominant_dash = '\u2014 '
+                for d in orig_dash_info:
+                    if d is not None:
+                        dominant_dash = d
+                        break
+                result_lines = []
+                for trans_line in trans_lines:
+                    trans_stripped = trans_line.lstrip()
+                    leading_ws = trans_line[:len(trans_line) - len(trans_stripped)]
+                    if get_dialogue_dash(trans_line) is not None:
+                        result_lines.append(trans_line)
+                    else:
+                        result_lines.append(leading_ws + dominant_dash + trans_stripped)
+                return '\n'.join(result_lines)
+            else:
+                return translated
+
+        result_lines = []
+        for i, (orig_line, trans_line) in enumerate(zip(orig_lines, trans_lines)):
+            orig_dash = orig_dash_info[i]
+            trans_stripped = trans_line.lstrip()
+            leading_ws = trans_line[:len(trans_line) - len(trans_stripped)]
+            trans_dash = get_dialogue_dash(trans_line)
+
+            if orig_dash is not None and trans_dash is None:
+                result_lines.append(leading_ws + orig_dash + trans_stripped)
+            elif orig_dash is None and trans_dash is not None:
+                result_lines.append(leading_ws + trans_stripped[len(trans_dash):])
+            else:
+                result_lines.append(trans_line)
+
+        return '\n'.join(result_lines)
+
+    def sync_dialogue_dashes_epub(self, original: str, translated: str) -> str:
+        def get_dialogue_dash(text):
+            stripped = text.lstrip()
+            for dash in ['\u2014 ', '\u2013 ', '- ']:
+                if stripped.startswith(dash):
+                    return dash
+            return None
+
+        def sync_single_line_dash(orig_line, trans_line):
+            orig_dash = get_dialogue_dash(orig_line)
+            trans_stripped = trans_line.lstrip()
+            leading_ws = trans_line[:len(trans_line) - len(trans_stripped)]
+            trans_dash = get_dialogue_dash(trans_line)
+
+            if orig_dash and not trans_dash:
+                return leading_ws + orig_dash + trans_stripped
+            elif not orig_dash and trans_dash:
+                return leading_ws + trans_stripped[len(trans_dash):]
+            return trans_line
+
+        if '\n' in original or '\n' in translated:
+            orig_lines = original.split('\n')
+            trans_lines = translated.split('\n')
+
+            if len(orig_lines) != len(trans_lines):
+                return sync_single_line_dash(original, translated)
+
+            result_lines = []
+            for orig_line, trans_line in zip(orig_lines, trans_lines):
+                result_lines.append(sync_single_line_dash(orig_line, trans_line))
+            return '\n'.join(result_lines)
+
+        return sync_single_line_dash(original, translated)
+
+    def sync_leading_whitespace_epub(self, original: str, translated: str) -> str:
+        orig_leading = re.match(r'^([ \t]*)', original)
+        orig_whitespace = orig_leading.group(1) if orig_leading else ''
+        trans_stripped = translated.lstrip(' \t')
+
+        return orig_whitespace + trans_stripped
+
+    def sync_first_letter_case_epub(self, original: str, translated: str) -> str:
+        def get_first_letter_info_local(text):
+            text_work = text.lstrip()
+            text_work = re.sub(f'^{ALL_QUOTES}+', '', text_work).lstrip()
+
+            if not text_work:
+                return None, None
+
+            in_tag = False
+            for i, char in enumerate(text_work):
+                if char == '<':
+                    in_tag = True
+                elif char == '>':
+                    in_tag = False
+                elif char.isalpha() and not in_tag:
+                    return i, char.isupper()
+
+            return None, None
+
+        orig_pos, orig_is_upper = get_first_letter_info_local(original)
+
+        if orig_pos is None:
+            return translated
+
+        trans_stripped = translated.lstrip()
+        leading_ws = translated[:len(translated) - len(trans_stripped)]
+
+        trans_no_quotes = re.sub(f'^{ALL_QUOTES}+', '', trans_stripped)
+        quote_prefix = trans_stripped[:len(trans_stripped) - len(trans_no_quotes)]
+
+        trans_no_quotes_stripped = trans_no_quotes.lstrip()
+        quote_ws = trans_no_quotes[:len(trans_no_quotes) - len(trans_no_quotes_stripped)]
+
+        if not trans_no_quotes_stripped:
+            return translated
+
+        result_chars = list(trans_no_quotes_stripped)
+        in_tag = False
+        for i, char in enumerate(result_chars):
+            if char == '<':
+                in_tag = True
+            elif char == '>':
+                in_tag = False
+            elif char.isalpha() and not in_tag:
+                if orig_is_upper:
+                    result_chars[i] = char.upper()
+                else:
+                    result_chars[i] = char.lower()
+                break
+
+        return leading_ws + quote_prefix + quote_ws + ''.join(result_chars)
+
+    def sync_ending_punctuation_epub(self, original: str, translated: str) -> str:
+        def get_ending_punctuation_local(text):
+            text_stripped = text.rstrip()
+            if not text_stripped:
+                return None, False, False
+
+            has_double = bool(re.search(f'{DOUBLE_QUOTES}$', text_stripped))
+
+            if has_double:
+                text_no_double = re.sub(f'{DOUBLE_QUOTES}+$', '', text_stripped).rstrip()
+            else:
+                text_no_double = text_stripped
+
+            if not text_no_double:
+                return None, has_double, False
+
+            has_apostrophe = bool(re.search(f'{SINGLE_QUOTES}$', text_no_double))
+
+            if has_apostrophe:
+                text_no_quotes = re.sub(f'{SINGLE_QUOTES}+$', '', text_no_double).rstrip()
+            else:
+                text_no_quotes = text_no_double
+
+            if not text_no_quotes:
+                return None, has_double, has_apostrophe
+
+            if _is_ellipsis_ending(text_no_quotes):
+                return 'ellipsis', has_double, has_apostrophe
+
+            last_char = text_no_quotes[-1]
+
+            punct_type = None
+            if last_char == '.':
+                punct_type = 'period'
+            elif last_char == ',':
+                punct_type = 'comma'
+            elif last_char == '!':
+                punct_type = 'exclamation'
+            elif last_char == '?':
+                punct_type = 'question'
+            elif last_char == '…':
+                punct_type = 'ellipsis'
+            elif last_char == ';':
+                punct_type = 'semicolon'
+            elif last_char == ':':
+                punct_type = 'colon'
+
+            return punct_type, has_double, has_apostrophe
+
+        def add_punctuation_local(text, punct_type):
+            text_stripped = text.rstrip()
+            trailing_ws = text[len(text_stripped):]
+
+            has_double = bool(re.search(f'{DOUBLE_QUOTES}$', text_stripped))
+            if has_double:
+                text_no_double = re.sub(f'{DOUBLE_QUOTES}+$', '', text_stripped)
+                trailing_double = text_stripped[len(text_no_double):]
+            else:
+                text_no_double = text_stripped
+                trailing_double = ''
+
+            has_apostrophe = bool(re.search(f'{SINGLE_QUOTES}$', text_no_double))
+            if has_apostrophe:
+                text_no_quotes = re.sub(f'{SINGLE_QUOTES}+$', '', text_no_double)
+                trailing_apostrophe = text_no_double[len(text_no_quotes):]
+                text_core = text_no_quotes.rstrip()
+                quotes_ws = text_no_quotes[len(text_core):]
+            else:
+                text_core = text_no_double.rstrip()
+                quotes_ws = text_no_double[len(text_core):]
+                trailing_apostrophe = ''
+
+            punct = '.' if punct_type == 'period' else ','
+            return text_core + punct + quotes_ws + trailing_apostrophe + trailing_double + trailing_ws
+
+        def remove_punctuation_local(text, punct_type):
+            text_stripped = text.rstrip()
+            trailing_ws = text[len(text_stripped):]
+
+            has_double = bool(re.search(f'{DOUBLE_QUOTES}$', text_stripped))
+            if has_double:
+                text_no_double = re.sub(f'{DOUBLE_QUOTES}+$', '', text_stripped)
+                trailing_double = text_stripped[len(text_no_double):]
+            else:
+                text_no_double = text_stripped
+                trailing_double = ''
+
+            has_apostrophe = bool(re.search(f'{SINGLE_QUOTES}$', text_no_double))
+            if has_apostrophe:
+                text_no_quotes = re.sub(f'{SINGLE_QUOTES}+$', '', text_no_double)
+                trailing_apostrophe = text_no_double[len(text_no_quotes):]
+                text_core = text_no_quotes.rstrip()
+            else:
+                text_core = text_no_double
+                trailing_apostrophe = ''
+
+            if not text_core:
+                return text
+
+            punct = '.' if punct_type == 'period' else ','
+            if text_core.endswith(punct):
+                text_core = text_core[:-1]
+
+            return text_core + trailing_apostrophe + trailing_double + trailing_ws
+
+        def replace_punctuation_local(text, from_punct, to_punct):
+            text_stripped = text.rstrip()
+            trailing_ws = text[len(text_stripped):]
+
+            has_double = bool(re.search(f'{DOUBLE_QUOTES}$', text_stripped))
+            if has_double:
+                text_no_double = re.sub(f'{DOUBLE_QUOTES}+$', '', text_stripped)
+                trailing_double = text_stripped[len(text_no_double):]
+            else:
+                text_no_double = text_stripped
+                trailing_double = ''
+
+            has_apostrophe = bool(re.search(f'{SINGLE_QUOTES}$', text_no_double))
+            if has_apostrophe:
+                text_no_quotes = re.sub(f'{SINGLE_QUOTES}+$', '', text_no_double)
+                trailing_apostrophe = text_no_double[len(text_no_quotes):]
+                text_core = text_no_quotes.rstrip()
+            else:
+                text_core = text_no_double
+                trailing_apostrophe = ''
+
+            if not text_core:
+                return text
+
+            from_char = '.' if from_punct == 'period' else ','
+            to_char = '.' if to_punct == 'period' else ','
+
+            if text_core.endswith(from_char):
+                text_core = text_core[:-1] + to_char
+
+            return text_core + trailing_apostrophe + trailing_double + trailing_ws
+
+        orig_punct, orig_has_double, orig_has_apos = get_ending_punctuation_local(original)
+        trans_punct, trans_has_double, trans_has_apos = get_ending_punctuation_local(translated)
+
+        if orig_punct == 'period':
+            if trans_punct == 'period':
+                return translated
+            elif trans_punct == 'comma':
+                return replace_punctuation_local(translated, 'comma', 'period')
+            elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
+                return translated
+            else:
+                return add_punctuation_local(translated, 'period')
+
+        elif orig_punct == 'comma':
+            if trans_punct == 'comma':
+                return translated
+            elif trans_punct == 'period':
+                return replace_punctuation_local(translated, 'period', 'comma')
+            elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
+                return translated
+            else:
+                return add_punctuation_local(translated, 'comma')
+
+        elif orig_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
+            return translated
+
+        else:
+            if trans_punct == 'period':
+                return remove_punctuation_local(translated, 'period')
+            elif trans_punct == 'comma':
+                return remove_punctuation_local(translated, 'comma')
+            elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
+                return translated
+            else:
+                return translated
+
+    def sync_all_caps(self, original: str, translated: str) -> str:
+        orig_letters_only = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', original)
+
+        if not orig_letters_only:
+            return translated
+
+        if not orig_letters_only.isupper():
+            return translated
+
+        if len(orig_letters_only) > 100:
+            trans_letters = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', translated)
+            if trans_letters:
+                upper_ratio = sum(1 for c in trans_letters if c.isupper()) / len(trans_letters)
+                if upper_ratio < 0.5:
+                    return translated
+
+        result = []
+        for char in translated:
+            if char.isalpha():
+                result.append(char.upper())
+            else:
+                result.append(char)
+
+        return ''.join(result)
+
+    def sync_leading_whitespace(self, original: str, translated: str) -> str:
+        if '\n' in original or '\n' in translated:
+            orig_lines = original.split('\n')
+            trans_lines = translated.split('\n')
+
+            if len(orig_lines) != len(trans_lines):
+                orig_leading = re.match(r'^([ \t]*)', original)
+                orig_whitespace = orig_leading.group(1) if orig_leading else ''
+                trans_stripped = translated.lstrip(' \t')
+                return orig_whitespace + trans_stripped
+
+            result_lines = []
+            for orig_line, trans_line in zip(orig_lines, trans_lines):
+                orig_leading = re.match(r'^([ \t]*)', orig_line)
+                orig_whitespace = orig_leading.group(1) if orig_leading else ''
+                trans_stripped = trans_line.lstrip(' \t')
+                result_lines.append(orig_whitespace + trans_stripped)
+
+            return '\n'.join(result_lines)
+
+        orig_leading = re.match(r'^([ \t]*)', original)
+        orig_whitespace = orig_leading.group(1) if orig_leading else ''
+        trans_stripped = translated.lstrip(' \t')
+
+        return orig_whitespace + trans_stripped
+
+    def sync_first_letter_case(self, original: str, translated: str) -> str:
+        def sync_single_line(orig_line, trans_line):
+            orig_pos, orig_is_upper = get_first_letter_info(orig_line)
+
+            if orig_pos is None:
+                return trans_line
+
+            trans_stripped = trans_line.lstrip()
+            leading_ws = trans_line[:len(trans_line) - len(trans_stripped)]
+
+            dash_prefix = ''
+            for dash in ['\u2014 ', '\u2013 ', '- ']:
+                if trans_stripped.startswith(dash):
+                    dash_prefix = dash
+                    trans_stripped = trans_stripped[len(dash):].lstrip()
+                    break
+
+            trans_no_quotes = re.sub(f'^{ALL_QUOTES}+', '', trans_stripped)
+            quote_prefix = trans_stripped[:len(trans_stripped) - len(trans_no_quotes)]
+
+            trans_no_quotes_stripped = trans_no_quotes.lstrip()
+            quote_ws = trans_no_quotes[:len(trans_no_quotes) - len(trans_no_quotes_stripped)]
+
+            if not trans_no_quotes_stripped:
+                return trans_line
+
+            result_chars = list(trans_no_quotes_stripped)
+            in_tag = False
+            for i, char in enumerate(result_chars):
+                if char == '<':
+                    in_tag = True
+                elif char == '>':
+                    in_tag = False
+                elif char.isalpha() and not in_tag:
+                    if orig_is_upper:
+                        result_chars[i] = char.upper()
+                    else:
+                        result_chars[i] = char.lower()
+                    break
+
+            return leading_ws + dash_prefix + quote_prefix + quote_ws + ''.join(result_chars)
+
+        if '\n' in original or '\n' in translated:
+            orig_lines = original.split('\n')
+            trans_lines = translated.split('\n')
+
+            if len(orig_lines) != len(trans_lines):
+                return sync_single_line(original, translated)
+
+            result_lines = []
+            for orig_line, trans_line in zip(orig_lines, trans_lines):
+                result_lines.append(sync_single_line(orig_line, trans_line))
+
+            return '\n'.join(result_lines)
+
+        return sync_single_line(original, translated)
+
+    def sync_ending_punctuation(self, original: str, translated: str) -> str:
+        def sync_single_line_ending(orig_line, trans_line):
+            orig_punct, _ = get_ending_punctuation(orig_line)
+            trans_punct, _ = get_ending_punctuation(trans_line)
+
+            if orig_punct == 'period':
+                if trans_punct == 'period':
+                    return trans_line
+                elif trans_punct == 'comma':
+                    return replace_punctuation(trans_line, 'comma', 'period')
+                elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
+                    return trans_line
+                else:
+                    return add_punctuation(trans_line, 'period')
+
+            elif orig_punct == 'comma':
+                if trans_punct == 'comma':
+                    return trans_line
+                elif trans_punct == 'period':
+                    return replace_punctuation(trans_line, 'period', 'comma')
+                elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
+                    return trans_line
+                else:
+                    return add_punctuation(trans_line, 'comma')
+
+            elif orig_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
+                return trans_line
+
+            else:
+                if trans_punct == 'period':
+                    return remove_punctuation(trans_line, 'period')
+                elif trans_punct == 'comma':
+                    return remove_punctuation(trans_line, 'comma')
+                elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
+                    return trans_line
+                else:
+                    return trans_line
+
+        if '\n' in original or '\n' in translated:
+            orig_lines = original.split('\n')
+            trans_lines = translated.split('\n')
+
+            if len(orig_lines) != len(trans_lines):
+                return sync_single_line_ending(original, translated)
+
+            result_lines = []
+            for i, (orig_line, trans_line) in enumerate(zip(orig_lines, trans_lines)):
+                if i == len(orig_lines) - 1:
+                    result_lines.append(sync_single_line_ending(orig_line, trans_line))
+                else:
+                    result_lines.append(trans_line)
+
+            return '\n'.join(result_lines)
+
+        return sync_single_line_ending(original, translated)
+
+    def sync_quotes(self, original: str, translated: str) -> str:
+        q_open = self._quote_open
+        q_close = self._quote_close
+        tp = self.tag_profile
+
+        def _count_active_quotes(text: str) -> int:
+            active_chars = {'"', q_open, q_close}
+            return sum(1 for ch in text if ch in active_chars)
+
+        def process_single_line(orig_line, trans_line):
+            orig_has_start = has_quote_at_start(orig_line, tag_profile=tp)
+            orig_has_end = has_quote_at_end(orig_line, tag_profile=tp)
+
+            trans_stripped = trans_line.lstrip()
+            trans_has_quote_start = bool(trans_stripped and re.match(ALL_QUOTES, trans_stripped))
+            trans_has_dash_start = bool(trans_stripped and (
+                trans_stripped.startswith('- ') or
+                trans_stripped.startswith('\u2013 ') or
+                trans_stripped.startswith('\u2014 ')
+            ))
+            trans_has_start = trans_has_quote_start or trans_has_dash_start
+
+            trans_has_end = has_quote_at_end(trans_line, tag_profile=tp)
+
+            result = trans_line
+
+            orig_quote_count = _count_active_quotes(orig_line)
+            orig_quote_parity_odd = (orig_quote_count % 2 != 0)
+            current_quote_count = _count_active_quotes(trans_line)
+            is_even = (current_quote_count % 2 == 0)
+
+            need_start = orig_has_start and not trans_has_start
+            need_end = orig_has_end and not trans_has_end
+
+            if need_start and need_end:
+                result = add_quote_to_start(result, q_open, tag_profile=tp)
+                result = add_quote_to_end(result, q_close, tag_profile=tp)
+                trans_has_start = True
+                trans_has_end = True
+            elif need_start:
+                if orig_has_start and trans_has_dash_start and not trans_has_quote_start:
+                    pass
+                elif not is_even or orig_quote_parity_odd:
+                    result = add_quote_to_start(result, q_open, tag_profile=tp)
+                    trans_has_start = True
+            elif need_end:
+                if not is_even or orig_quote_parity_odd:
+                    result = add_quote_to_end(result, q_close, tag_profile=tp)
+                    trans_has_end = True
+            else:
+                pass
+
+            if (not orig_has_start and trans_has_quote_start) and (not orig_has_end and trans_has_end):
+                result = remove_quote_from_start(result, force=True, tag_profile=tp)
+                result = remove_quote_from_end(result, force=True, tag_profile=tp)
+            else:
+                if not orig_has_start and trans_has_quote_start:
+                    result = remove_quote_from_start(result, tag_profile=tp)
+                if not orig_has_end and trans_has_end:
+                    result = remove_quote_from_end(result, tag_profile=tp)
+
+            if self.file_type in ["epub", "txt"]:
+                orig_has_dash = contains_dash(orig_line)
+                trans_has_dash = contains_dash(result)
+
+                if not orig_has_dash and trans_has_dash:
+                    total_double_quote_count = _count_active_quotes(result)
+                    external_quote_count = count_external_quotes(result, tag_profile=tp)
+
+                    if total_double_quote_count % 2 != 0 and external_quote_count == 1:
+                        result_stripped = result.lstrip()
+                        if result_stripped and re.match(ALL_QUOTES, result_stripped):
+                            if (total_double_quote_count - 1) % 2 == 0:
+                                result = remove_quote_from_start(result, force=True, tag_profile=tp)
+                        else:
+                            result_stripped_end = result.rstrip()
+                            if result_stripped_end and re.match(ALL_QUOTES, result_stripped_end[-1]):
+                                if (total_double_quote_count - 1) % 2 == 0:
+                                    result = remove_quote_from_end(result, force=True, tag_profile=tp)
+
+            return result
+
+        if self.file_type == "srt":
+            if '\n' in original or '\n' in translated:
+                orig_lines = original.split('\n')
+                trans_lines = translated.split('\n')
+
+                if len(orig_lines) != len(trans_lines):
+                    return translated
+
+                result_lines = []
+                for orig_line, trans_line in zip(orig_lines, trans_lines):
+                    result_lines.append(process_single_line(orig_line, trans_line))
+
+                return '\n'.join(result_lines)
+            else:
+                return process_single_line(original, translated)
+
+        else:
+            return process_single_line(original, translated)
+
+    def sync_formatting_legacy_srt(self, original: str, translated: str) -> str:
+        result = translated
+
+        result = self.sync_quotes(original, result)
+
+        result = self.sync_dialogue_dashes_srt(original, result)
+
+        result = self.sync_leading_whitespace(original, result)
+
+        result = self._sync_all_caps_legacy(original, result)
+
+        orig_letters_only = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', original)
+        is_all_caps = orig_letters_only.isupper() if orig_letters_only else False
+
+        if not is_all_caps:
+            result = self.sync_first_letter_case(original, result)
+
+        result = self.sync_ending_punctuation(original, result)
+
+        return result
+
+    def sync_formatting_legacy_epub(self, original: str, translated: str) -> str:
+        result = translated
+
+        result = self.sync_dialogue_dashes_epub(original, result)
+
+        result = self.sync_quotes(original, result)
+
+        result = self.sync_leading_whitespace_epub(original, result)
+
+        result = self._sync_all_caps_legacy(original, result)
+
+        orig_letters_only = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', original)
+        is_all_caps = orig_letters_only.isupper() if orig_letters_only else False
+
+        if not is_all_caps:
+            result = self.sync_first_letter_case_epub(original, result)
+
+        result = self.sync_ending_punctuation_epub(original, result)
+
+        result = self._remove_temporary_markers(result)
+
+        return result
+
+    def _remove_temporary_markers(self, text: str) -> str:
+        tp = self.tag_profile
+        nt_re = tp.non_trans_open_re()
+        nt_markers = [m.group(0) for m in nt_re.finditer(text)]
+        if nt_markers:
+            logger.warning(f"Found {len(nt_markers)} unreplaced NT markers - removing them")
+            for marker in nt_markers:
+                logger.warning(f"  Unreplaced: {marker}")
+
+        cleaned = nt_re.sub('', text)
+
+        ps_any_re = re.compile(rf'</?{re.escape(tp.paragraph_separator)}>')
+        ps_markers = ps_any_re.findall(cleaned)
+        if ps_markers:
+            logger.warning(
+                f"Found {len(ps_markers)} unreplaced PS markers - removing them"
+            )
+        cleaned = ps_any_re.sub('', cleaned)
+
+        cleaned = re.sub(r'  +', ' ', cleaned)
+
+        return cleaned
